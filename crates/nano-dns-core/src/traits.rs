@@ -6,7 +6,7 @@
 use std::future::Future;
 
 use crate::error::Result;
-use crate::model::{Decision, QueryContext, Response};
+use crate::model::{Decision, QueryContext, QueryEvent, Response, StatsSnapshot};
 
 /// Resolves a query into a DNS response.
 pub trait Resolver: Send + Sync {
@@ -42,12 +42,19 @@ pub trait DnsCache: Send + Sync {
 
 /// Optional persistence sink. Implementations must never block DNS queries.
 pub trait Storage: Send + Sync {
-    /// Persist a state snapshot outside the critical path.
+    /// Queue one completed query for persistence.
+    fn record(&self, event: QueryEvent) -> Result<()>;
+    /// Flush queued events to durable storage.
+    ///
+    /// This is intended for shutdown or maintenance, not for the request path.
     fn flush(&self) -> Result<()>;
 }
 
 /// Optional statistics sink.
 pub trait StatsSink: Send + Sync {
     /// Record one completed query.
-    fn record(&self, context: &QueryContext, decision: Decision, response: &Response);
+    fn record(&self, event: &QueryEvent);
+
+    /// Return counters for queries recorded in the configured retention window.
+    fn snapshot(&self) -> StatsSnapshot;
 }

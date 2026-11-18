@@ -4,7 +4,10 @@
 //! and `nano-dns-resolver`. This module only contains the small vocabulary
 //! needed to connect the pipeline stages.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
+
+use serde::{Deserialize, Serialize};
 
 /// Identity of a client that sent a DNS query.
 ///
@@ -93,6 +96,63 @@ pub enum Decision {
     Block,
 }
 
+/// One completed DNS query recorded by optional persistence.
+///
+/// This type is protocol-neutral: the numeric response code is extracted by
+/// the transport layer, which owns the DNS message representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEvent {
+    /// Completion time as milliseconds since the Unix epoch.
+    pub timestamp_ms: u64,
+    /// Configured client identifier, when one matched.
+    pub client_id: Option<String>,
+    /// Observed peer address.
+    pub client_address: IpAddr,
+    /// Transport used by the client.
+    pub transport: Transport,
+    /// Lower-cased queried name.
+    pub name: String,
+    /// Numeric DNS record type.
+    pub query_type: u16,
+    /// Numeric DNS class.
+    pub query_class: u16,
+    /// Policy decision for this query.
+    pub decision: Decision,
+    /// Numeric DNS response code.
+    pub response_code: u16,
+    /// Remaining TTL returned to the client.
+    pub ttl_secs: u32,
+    /// Whether the response was negative.
+    pub negative: bool,
+    /// Whether the response was served from the DNS cache.
+    pub cache_hit: bool,
+}
+
+/// Aggregated counters for a recent time window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatsSnapshot {
+    /// Number of queries in the window.
+    pub total_queries: u64,
+    /// Number of allowed queries.
+    pub allowed: u64,
+    /// Number of blocked queries.
+    pub blocked: u64,
+    /// Number of cache hits.
+    pub cache_hits: u64,
+    /// Number of SERVFAIL responses.
+    pub errors: u64,
+    /// Counters by numeric response code.
+    pub response_codes: BTreeMap<u16, u64>,
+    /// Counters by query type.
+    pub query_types: BTreeMap<u16, u64>,
+    /// Counters by transport name.
+    pub transports: BTreeMap<String, u64>,
+    /// Most queried domains, highest count first.
+    pub top_domains: Vec<(String, u64)>,
+    /// Number of domains kept in the top-domain table.
+    pub top_domains_capacity: usize,
+}
+
 /// A resolved response ready to be encoded and returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
@@ -102,6 +162,8 @@ pub struct Response {
     pub ttl_secs: u32,
     /// Whether the response is a negative (NXDOMAIN/NODATA) answer.
     pub negative: bool,
+    /// Whether the response was served from the DNS cache.
+    pub cache_hit: bool,
 }
 
 #[cfg(test)]

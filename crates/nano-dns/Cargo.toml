@@ -9,21 +9,23 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+nano-dns-api = { workspace = true, optional = true }
 nano-dns-core.workspace = true
 nano-dns-protocol.workspace = true
+nano-dns-web = { workspace = true, optional = true }
 clap.workspace = true
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 [features]
 default = ["forward", "blocker"]
 forward = []
-recursive = []
-blocker = []
-sqlite = []
-statistics = []
-api = []
-web = []
+recursive = ["nano-dns-protocol/recursive"]
+blocker = ["nano-dns-protocol/blocker"]
+sqlite = ["nano-dns-protocol/sqlite"]
+statistics = ["nano-dns-protocol/statistics"]
+api = ["dep:nano-dns-api"]
+web = ["dep:nano-dns-web"]
 doh = []
 dot = []
 dnssec = []

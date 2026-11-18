@@ -12,9 +12,16 @@ repository = "https://github.com/codigominimo/NanoDNS"
 publish = false
 
 [workspace.dependencies]
+nano-dns-api = { path = "crates/nano-dns-api" }
+nano-dns-blocker = { path = "crates/nano-dns-blocker" }
+nano-dns-cache = { path = "crates/nano-dns-cache" }
 nano-dns-core = { path = "crates/nano-dns-core" }
+nano-dns-http = { path = "crates/nano-dns-http" }
 nano-dns-protocol = { path = "crates/nano-dns-protocol" }
 nano-dns-resolver = { path = "crates/nano-dns-resolver" }
+nano-dns-stats = { path = "crates/nano-dns-stats" }
+nano-dns-storage = { path = "crates/nano-dns-storage" }
+nano-dns-web = { path = "crates/nano-dns-web" }
 thiserror = { version = "2.0", default-features = false }
 serde = { version = "1.0", features = ["derive"], default-features = false }
 serde_json = { version = "1.0", features = ["std"], default-features = false }
@@ -26,6 +33,7 @@ ipnet = { version = "2.12", default-features = false, features = ["std", "serde"
 hickory-server = { version = "0.26.3", default-features = false }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 async-trait = { version = "0.1", default-features = false }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
 
 [profile.release]
 opt-level = 3

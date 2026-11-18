@@ -170,8 +170,15 @@ pub struct ResolverConfig {
     pub retries: u8,
     /// Validate DNSSEC responses (Fase 11).
     pub dnssec: bool,
-    /// Root hints used in recursive mode (files or inline addresses).
+    /// Root hints used in recursive mode.
     pub root_hints: Vec<IpAddr>,
+    /// UDP/TCP port used for root hint servers.
+    #[serde(default = "default_root_port")]
+    pub root_port: u16,
+}
+
+const fn default_root_port() -> u16 {
+    53
 }
 
 impl Default for ResolverConfig {
@@ -183,6 +190,7 @@ impl Default for ResolverConfig {
             retries: 2,
             dnssec: false,
             root_hints: Vec::new(),
+            root_port: default_root_port(),
         }
     }
 }
@@ -626,6 +634,11 @@ impl Config {
                         "resolver.root_hints cannot be empty in recursive mode".to_owned(),
                     ));
                 }
+                if self.resolver.root_port == 0 {
+                    return Err(ConfigError::Validation(
+                        "resolver.root_port must be greater than zero".to_owned(),
+                    ));
+                }
             }
         }
 
@@ -670,15 +683,41 @@ impl Config {
                 "SQLite persistence requested but the binary was built without the 'sqlite' feature".to_owned(),
             ));
         }
+        if !self.storage.enabled && self.storage.history {
+            return Err(ConfigError::Validation(
+                "storage.history cannot be enabled while storage is disabled".to_owned(),
+            ));
+        }
+        if self.storage.enabled && self.storage.path.as_os_str().is_empty() {
+            return Err(ConfigError::Validation(
+                "storage.path cannot be empty when storage is enabled".to_owned(),
+            ));
+        }
         if self.stats.enabled && !features.statistics {
             return Err(ConfigError::Validation(
                 "statistics requested but the binary was built without the 'statistics' feature"
                     .to_owned(),
             ));
         }
+        if self.stats.enabled && self.stats.retention_secs == 0 {
+            return Err(ConfigError::Validation(
+                "stats.retention_secs must be greater than zero when enabled".to_owned(),
+            ));
+        }
         if self.api.enabled && !features.api {
             return Err(ConfigError::Validation(
                 "API requested but the binary was built without the 'api' feature".to_owned(),
+            ));
+        }
+        if self.api.enabled
+            && self
+                .api
+                .token
+                .as_ref()
+                .is_some_and(|token| token.is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "api.token cannot be empty when configured".to_owned(),
             ));
         }
         if self.web.enabled && !features.web {
@@ -857,6 +896,9 @@ mod tests {
         config
             .validate(&all)
             .expect("recursive configuration must be valid");
+
+        config.resolver.root_port = 0;
+        assert!(config.validate(&all).is_err());
     }
 
     #[test]
@@ -870,6 +912,27 @@ mod tests {
         config
             .validate(&all)
             .expect("sqlite feature allows persistence");
+
+        config.storage.enabled = false;
+        config.storage.history = true;
+        assert!(config.validate(&all).is_err());
+
+        config.storage.enabled = true;
+        config.storage.path = PathBuf::new();
+        assert!(config.validate(&all).is_err());
+    }
+
+    #[test]
+    fn stats_require_positive_retention() {
+        let mut all = features();
+        all.statistics = true;
+        let mut config = Config::default();
+        config.stats.enabled = true;
+        config.stats.retention_secs = 0;
+        assert!(config.validate(&all).is_err());
+
+        config.stats.retention_secs = 60;
+        config.validate(&all).expect("positive retention is valid");
     }
 
     #[test]

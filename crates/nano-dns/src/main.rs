@@ -1,15 +1,19 @@
 //! NanoDNS executable entry point.
 //!
-//! Phase 3 loads configuration, starts UDP/TCP DNS listeners, forwards queries
-//! to upstream resolvers and manages a graceful shutdown.
+//! Loads configuration, starts UDP/TCP DNS listeners and the optional REST API
+//! and web dashboard, then coordinates graceful shutdown across all servers.
 
 use std::path::PathBuf;
 
 use clap::Parser;
-use nano_dns_core::config::{self, DEFAULT_CONFIG_FILE, Features};
+#[cfg(feature = "api")]
+use nano_dns_api::ApiServer;
+use nano_dns_core::config::{self, Config, DEFAULT_CONFIG_FILE, Features};
 use nano_dns_core::error::Result;
 use nano_dns_core::runtime;
 use nano_dns_protocol::DnsServer;
+#[cfg(feature = "web")]
+use nano_dns_web::WebServer;
 use tracing::info;
 
 /// Command-line arguments accepted by NanoDNS.
@@ -54,11 +58,76 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    runtime::run(async move {
-        info!(instance = %config.general.instance_name, "NanoDNS started");
-        let mut server = DnsServer::bind(&config).await?;
-        server.serve_with_signal(runtime::shutdown_signal()).await
-    })
+    runtime::run(run_servers(config))
+}
+
+/// Start all configured servers and stop them together on shutdown.
+async fn run_servers(config: Config) -> Result<()> {
+    info!(instance = %config.general.instance_name, "NanoDNS started");
+    let mut server = DnsServer::bind(&config).await?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        runtime::shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    #[cfg(feature = "api")]
+    let api = if config.api.enabled {
+        Some(ApiServer::bind(&config, server.stats_sink()).await?)
+    } else {
+        None
+    };
+
+    #[cfg(feature = "web")]
+    let web = if config.web.enabled {
+        Some(WebServer::bind(&config, server.stats_sink()).await?)
+    } else {
+        None
+    };
+
+    #[cfg(feature = "api")]
+    let api_rx = shutdown_rx.clone();
+    #[cfg(feature = "api")]
+    let api_task = async {
+        match api {
+            Some(api) => api.serve_with_signal(wait_shutdown(api_rx)).await,
+            None => Ok(()),
+        }
+    };
+    #[cfg(not(feature = "api"))]
+    let api_task = async { Ok::<(), nano_dns_core::error::Error>(()) };
+
+    #[cfg(feature = "web")]
+    let web_rx = shutdown_rx.clone();
+    #[cfg(feature = "web")]
+    let web_task = async {
+        match web {
+            Some(web) => web.serve_with_signal(wait_shutdown(web_rx)).await,
+            None => Ok(()),
+        }
+    };
+    #[cfg(not(feature = "web"))]
+    let web_task = async { Ok::<(), nano_dns_core::error::Error>(()) };
+
+    let (dns_result, api_result, web_result) = tokio::join!(
+        server.serve_with_signal(wait_shutdown(shutdown_rx)),
+        api_task,
+        web_task
+    );
+    dns_result?;
+    api_result?;
+    web_result?;
+    Ok(())
+}
+
+/// Resolve when the shared shutdown flag is set.
+async fn wait_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]

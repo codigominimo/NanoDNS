@@ -29,7 +29,8 @@
     "timeout_ms": 2000,
     "retries": 2,
     "dnssec": false,
-    "root_hints": []
+    "root_hints": [],
+    "root_port": 53
   },
   "dns_cache": {
     "enabled": true,

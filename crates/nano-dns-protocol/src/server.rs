@@ -2,19 +2,32 @@
 
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use hickory_server::Server;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+#[cfg(feature = "blocker")]
+use nano_dns_blocker::DomainBlocker;
+use nano_dns_cache::{CachingResolver, MemoryCache};
 use nano_dns_core::config::{Config, ListenerConfig, ResolverMode};
 use nano_dns_core::error::Result;
-use nano_dns_core::model::DnsQuery;
-use nano_dns_core::traits::Resolver;
+use nano_dns_core::error::Result as CoreResult;
+use nano_dns_core::model::StatsSnapshot;
+use nano_dns_core::model::{DnsQuery, Response as CoreResponse};
+use nano_dns_core::traits::{Policy, Resolver, StatsSink, Storage};
 use nano_dns_resolver::ForwardResolver;
+#[cfg(feature = "recursive")]
+use nano_dns_resolver::RecursiveResolver;
+#[cfg(feature = "statistics")]
+use nano_dns_stats::StatsCollector;
+#[cfg(feature = "sqlite")]
+use nano_dns_storage::SqliteStorage;
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{info, warn};
 
 use crate::error::ProtocolError;
-use crate::handler::{NanoRequestHandler, RequestLimits};
+use crate::handler::{BlockSettings, NanoRequestHandler, RequestLimits};
 
 /// TCP connection inactivity timeout.
 const TCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -22,30 +35,115 @@ const TCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Outgoing response slots reserved per TCP connection.
 const TCP_RESPONSE_BUFFER: usize = 128;
 
+/// Upstream resolver selected by the configured resolution mode.
+pub enum UpstreamResolver {
+    /// Forward mode.
+    Forward(ForwardResolver),
+    /// Recursive mode, available only when compiled with `recursive`.
+    #[cfg(feature = "recursive")]
+    Recursive(RecursiveResolver),
+}
+
+impl Resolver for UpstreamResolver {
+    type Query = DnsQuery;
+    type Future<'a> = Pin<Box<dyn Future<Output = CoreResult<CoreResponse>> + Send + 'a>>;
+
+    fn resolve(
+        &self,
+        query: DnsQuery,
+        context: &nano_dns_core::model::QueryContext,
+    ) -> Self::Future<'_> {
+        match self {
+            Self::Forward(resolver) => resolver.resolve(query, context),
+            #[cfg(feature = "recursive")]
+            Self::Recursive(resolver) => resolver.resolve(query, context),
+        }
+    }
+}
+
+/// Resolver type installed in the production server.
+pub type PipelineResolver = CachingResolver<UpstreamResolver, MemoryCache>;
+
 /// Owns all configured UDP/TCP DNS listeners.
 pub struct DnsServer<R>
 where
     R: Resolver<Query = DnsQuery> + 'static,
 {
     server: Server<NanoRequestHandler<R>>,
+    storage: Option<Arc<dyn Storage>>,
+    stats: Option<Arc<dyn StatsSink>>,
 }
 
-impl DnsServer<ForwardResolver> {
+impl DnsServer<PipelineResolver> {
     /// Bind and register every configured UDP/TCP listener.
     pub async fn bind(config: &Config) -> Result<Self> {
+        #[cfg(not(feature = "recursive"))]
         if config.resolver.mode == ResolverMode::Recursive {
             return Err(ProtocolError::Server(
-                "recursive mode is not implemented until Phase 6".to_owned(),
+                "recursive mode requires the 'recursive' feature".to_owned(),
             )
             .into());
         }
 
-        let clients = config.clients.values().cloned().collect();
+        let clients: Vec<_> = config.clients.values().cloned().collect();
         let limits = RequestLimits::from_config(&config.listeners);
-        let resolver = ForwardResolver::new(&config.resolver)?;
+        #[cfg(feature = "recursive")]
+        let upstream = if config.resolver.mode == ResolverMode::Recursive {
+            UpstreamResolver::Recursive(RecursiveResolver::new(&config.resolver)?)
+        } else {
+            UpstreamResolver::Forward(ForwardResolver::new(&config.resolver)?)
+        };
+        #[cfg(not(feature = "recursive"))]
+        let upstream = UpstreamResolver::Forward(ForwardResolver::new(&config.resolver)?);
+        let resolver = if config.dns_cache.enabled {
+            CachingResolver::new(upstream, MemoryCache::new(&config.dns_cache))
+        } else {
+            CachingResolver::passthrough(upstream)
+        };
+
+        #[cfg(feature = "blocker")]
+        let policy: Option<Arc<dyn Policy<Query = DnsQuery>>> = if config.blocker.enabled {
+            let cache = config.policy_cache.enabled.then_some(&config.policy_cache);
+            Some(Arc::new(DomainBlocker::new(
+                &config.blocker,
+                &clients,
+                cache,
+            )?))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "blocker"))]
+        let policy: Option<Arc<dyn Policy<Query = DnsQuery>>> = None;
+        let block = BlockSettings::from_config(&config.blocker);
+
+        #[cfg(feature = "sqlite")]
+        let storage: Option<Arc<dyn Storage>> = if config.storage.enabled {
+            Some(Arc::new(SqliteStorage::open(&config.storage)?) as Arc<dyn Storage>)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "sqlite"))]
+        let storage: Option<Arc<dyn Storage>> = None;
+
+        #[cfg(feature = "statistics")]
+        let stats: Option<Arc<dyn StatsSink>> = if config.stats.enabled {
+            Some(Arc::new(StatsCollector::new(&config.stats)) as Arc<dyn StatsSink>)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "statistics"))]
+        let stats: Option<Arc<dyn StatsSink>> = None;
 
         let mut server = Server::with_access(
-            NanoRequestHandler::new(limits, clients, resolver),
+            NanoRequestHandler::with_sinks(
+                limits,
+                clients,
+                resolver,
+                policy,
+                block,
+                storage.clone(),
+                stats.clone(),
+            ),
             [],
             allowed_networks(config),
         );
@@ -59,11 +157,20 @@ impl DnsServer<ForwardResolver> {
             return Err(ProtocolError::Server("no listeners were registered".to_owned()).into());
         }
 
-        Ok(Self { server })
+        Ok(Self {
+            server,
+            storage,
+            stats,
+        })
     }
+}
 
+impl<R> DnsServer<R>
+where
+    R: Resolver<Query = DnsQuery> + 'static,
+{
     async fn bind_listener(
-        server: &mut Server<NanoRequestHandler<ForwardResolver>>,
+        server: &mut Server<NanoRequestHandler<R>>,
         listener: &ListenerConfig,
     ) -> Result<usize> {
         let mut registered = 0usize;
@@ -94,12 +201,17 @@ impl DnsServer<ForwardResolver> {
 
         Ok(registered)
     }
-}
 
-impl<R> DnsServer<R>
-where
-    R: Resolver<Query = DnsQuery> + 'static,
-{
+    /// Shared statistics sink, when statistics collection is enabled.
+    pub fn stats_sink(&self) -> Option<Arc<dyn StatsSink>> {
+        self.stats.clone()
+    }
+
+    /// Current statistics snapshot, when statistics collection is enabled.
+    pub fn stats_snapshot(&self) -> Option<StatsSnapshot> {
+        self.stats.as_ref().map(|stats| stats.snapshot())
+    }
+
     /// Run until every listener task finishes.
     pub async fn run(&mut self) -> Result<()> {
         self.server
@@ -136,9 +248,20 @@ where
         }
     }
 
-    /// Stop accepting new queries and wait for listener tasks to finish.
+    /// Stop accepting new queries, flush persistence and wait for listeners.
     pub async fn shutdown(&mut self) -> Result<()> {
-        if let Err(error) = self.server.shutdown_gracefully().await {
+        let shutdown = self.server.shutdown_gracefully().await;
+
+        if let Some(storage) = &self.storage {
+            let storage = Arc::clone(storage);
+            match tokio::task::spawn_blocking(move || storage.flush()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(%error, "cannot flush query history on shutdown"),
+                Err(error) => warn!(%error, "persistence flush task failed"),
+            }
+        }
+
+        if let Err(error) = shutdown {
             warn!(%error, "DNS server did not shut down cleanly");
             return Err(ProtocolError::Shutdown(error.to_string()).into());
         }

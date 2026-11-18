@@ -2,24 +2,24 @@
 //!
 //! Queries are sent unchanged to configured upstreams. UDP is attempted first
 //! unless an upstream is marked `tcp: true`; truncated UDP answers are retried
-//! over TCP. DNSSEC validation and recursive resolution are future phases.
+//! over TCP. DNSSEC validation and recursive resolution live in separate
+//! modules.
 
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode};
 use nano_dns_core::config::{ResolverConfig, ResolverMode};
 use nano_dns_core::error::Result as CoreResult;
 use nano_dns_core::model::{DnsQuery, QueryContext, Response as CoreResponse};
 use nano_dns_core::traits::Resolver;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::error::ResolverError;
+use crate::response::into_core_response;
+use crate::transport::{exchange_tcp, exchange_with_truncation};
 
 /// Default EDNS UDP payload size when the client did not advertise one.
 const DEFAULT_UDP_PAYLOAD: u16 = 1232;
@@ -44,7 +44,7 @@ impl ForwardResolver {
     pub fn new(config: &ResolverConfig) -> CoreResult<Self> {
         if config.mode != ResolverMode::Forward {
             return Err(ResolverError::Unsupported(
-                "recursive mode is implemented in a later phase".to_owned(),
+                "forward resolver requires forward mode".to_owned(),
             )
             .into());
         }
@@ -114,15 +114,9 @@ async fn resolve_with_upstreams(
     for _attempt in 0..=u32::from(retries) {
         for target in &upstreams {
             let exchange = if target.tcp_only {
-                exchange_tcp(&query.bytes, target, deadline).await
+                exchange_tcp(&query.bytes, target.address, deadline).await
             } else {
-                match exchange_udp(&query.bytes, target, deadline, udp_payload).await {
-                    Ok(message) if message.metadata.truncation => {
-                        debug!(address = %target.address, "UDP response truncated; retrying over TCP");
-                        exchange_tcp(&query.bytes, target, deadline).await
-                    }
-                    result => result,
-                }
+                exchange_with_truncation(&query.bytes, target.address, deadline, udp_payload).await
             };
 
             match exchange {
@@ -145,120 +139,6 @@ async fn resolve_with_upstreams(
         debug!(%error, "all upstream attempts failed");
     }
     Err(ResolverError::NoUpstream.into())
-}
-
-/// Send one UDP query and decode the answer.
-async fn exchange_udp(
-    query_bytes: &[u8],
-    target: &UpstreamTarget,
-    deadline: Duration,
-    udp_payload: usize,
-) -> Result<Message, ResolverError> {
-    let bind_address = if target.address.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind_address)
-        .await
-        .map_err(|source| ResolverError::Io {
-            address: target.address,
-            source,
-        })?;
-    socket
-        .connect(target.address)
-        .await
-        .map_err(|source| ResolverError::Io {
-            address: target.address,
-            source,
-        })?;
-    socket
-        .send(query_bytes)
-        .await
-        .map_err(|source| ResolverError::Io {
-            address: target.address,
-            source,
-        })?;
-
-    let mut buffer = vec![0u8; udp_payload];
-    let len = timeout(deadline, socket.recv(&mut buffer))
-        .await
-        .map_err(|_| ResolverError::Timeout {
-            address: target.address,
-            timeout: deadline,
-        })?
-        .map_err(|source| ResolverError::Io {
-            address: target.address,
-            source,
-        })?;
-
-    Message::from_vec(&buffer[..len]).map_err(|error| ResolverError::InvalidResponse {
-        address: target.address,
-        reason: error.to_string(),
-    })
-}
-
-/// Send one length-prefixed TCP query and decode the answer.
-async fn exchange_tcp(
-    query_bytes: &[u8],
-    target: &UpstreamTarget,
-    deadline: Duration,
-) -> Result<Message, ResolverError> {
-    let mut stream =
-        TcpStream::connect(target.address)
-            .await
-            .map_err(|source| ResolverError::Io {
-                address: target.address,
-                source,
-            })?;
-
-    let length = u16::try_from(query_bytes.len()).map_err(|_| ResolverError::InvalidResponse {
-        address: target.address,
-        reason: "query exceeds DNS TCP length prefix".to_owned(),
-    })?;
-    stream
-        .write_all(&length.to_be_bytes())
-        .await
-        .map_err(|source| ResolverError::Io {
-            address: target.address,
-            source,
-        })?;
-    stream
-        .write_all(query_bytes)
-        .await
-        .map_err(|source| ResolverError::Io {
-            address: target.address,
-            source,
-        })?;
-
-    let mut length_buffer = [0u8; 2];
-    timeout(deadline, stream.read_exact(&mut length_buffer))
-        .await
-        .map_err(|_| ResolverError::Timeout {
-            address: target.address,
-            timeout: deadline,
-        })?
-        .map_err(|source| ResolverError::Io {
-            address: target.address,
-            source,
-        })?;
-
-    let mut buffer = vec![0u8; usize::from(u16::from_be_bytes(length_buffer))];
-    timeout(deadline, stream.read_exact(&mut buffer))
-        .await
-        .map_err(|_| ResolverError::Timeout {
-            address: target.address,
-            timeout: deadline,
-        })?
-        .map_err(|source| ResolverError::Io {
-            address: target.address,
-            source,
-        })?;
-
-    Message::from_vec(&buffer).map_err(|error| ResolverError::InvalidResponse {
-        address: target.address,
-        reason: error.to_string(),
-    })
 }
 
 /// Reject responses that do not answer the original question.
@@ -296,27 +176,6 @@ fn validate_response(
     Ok(())
 }
 
-/// Convert a validated Hickory message into the core response representation.
-fn into_core_response(message: Message) -> CoreResult<CoreResponse> {
-    let ttl_secs = message
-        .answers
-        .iter()
-        .map(|record| record.ttl)
-        .min()
-        .unwrap_or_default();
-    let negative = message.metadata.response_code == ResponseCode::NXDomain
-        || (message.metadata.response_code == ResponseCode::NoError && message.answers.is_empty());
-    let bytes = message
-        .to_vec()
-        .map_err(|error| ResolverError::Encode(error.to_string()))?;
-
-    Ok(CoreResponse {
-        bytes,
-        ttl_secs,
-        negative,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
@@ -336,6 +195,7 @@ mod tests {
             retries: 2,
             dnssec: false,
             root_hints: Vec::new(),
+            root_port: 53,
         }
     }
 
