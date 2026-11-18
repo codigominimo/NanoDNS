@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "general": {
+    "instance_name": "NanoDNS",
+    "daemon": false,
+    "log_level": "info"
+  },
+  "listeners": {
+    "ip_version": "v4",
+    "entries": [
+      {
+        "address": "127.0.0.1",
+        "port_udp": 53,
+        "port_tcp": 53,
+        "dot": false,
+        "doh": false
+      }
+    ],
+    "max_packet_bytes": 1232,
+    "max_concurrent_queries": 1024,
+    "allowed_networks": ["127.0.0.0/8", "::1/128"]
+  },
+  "resolver": {
+    "mode": "forward",
+    "upstreams": [
+      { "address": "1.1.1.1", "port": 53, "tcp": false },
+      { "address": "8.8.8.8", "port": 53, "tcp": false }
+    ],
+    "timeout_ms": 2000,
+    "retries": 2,
+    "dnssec": false,
+    "root_hints": []
+  },
+  "dns_cache": {
+    "enabled": true,
+    "max_entries": 4096,
+    "max_bytes": 16777216,
+    "max_ttl_secs": 86400,
+    "negative_ttl_secs": 60
+  },
+  "policy_cache": {
+    "enabled": true,
+    "max_entries": 8192
+  },
+  "blocker": {
+    "enabled": true,
+    "block_response": "NXDOMAIN",
+    "categories": ["advertising", "trackers", "malware", "phishing"],
+    "lists": [],
+    "allowlist": [],
+    "denylist": [],
+    "lists_dir": "data/lists",
+    "sinkhole_v4": "0.0.0.0",
+    "sinkhole_v6": "::"
+  },
+  "clients": {},
+  "storage": {
+    "enabled": false,
+    "path": "data/database/nano-dns.sqlite3",
+    "history": false
+  },
+  "stats": {
+    "enabled": false,
+    "retention_secs": 86400
+  },
+  "api": {
+    "enabled": false,
+    "listen": "127.0.0.1",
+    "port": 8080,
+    "token": null,
+    "allowed_networks": ["127.0.0.0/8", "::1/128"]
+  },
+  "web": {
+    "enabled": false,
+    "listen": "127.0.0.1",
+    "port": 8081
+  },
+  "dot": {
+    "enabled": false,
+    "cert_path": null,
+    "key_path": null
+  },
+  "doh": {
+    "enabled": false,
+    "path": "/dns-query",
+    "cert_path": null,
+    "key_path": null
+  }
+}

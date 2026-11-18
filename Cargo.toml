@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+authors = ["codigominimo"]
+repository = "https://github.com/codigominimo/NanoDNS"
+publish = false
+
+[workspace.dependencies]
+nano-dns-core = { path = "crates/nano-dns-core" }
+nano-dns-protocol = { path = "crates/nano-dns-protocol" }
+nano-dns-resolver = { path = "crates/nano-dns-resolver" }
+thiserror = { version = "2.0", default-features = false }
+serde = { version = "1.0", features = ["derive"], default-features = false }
+serde_json = { version = "1.0", features = ["std"], default-features = false }
+tokio = { version = "1.54", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "env-filter", "fmt"] }
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "error-context"] }
+ipnet = { version = "2.12", default-features = false, features = ["std", "serde"] }
+hickory-server = { version = "0.26.3", default-features = false }
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+async-trait = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
