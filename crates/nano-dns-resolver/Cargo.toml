@@ -11,10 +11,13 @@ publish.workspace = true
 [features]
 default = []
 recursive = []
+dnssec = ["hickory-net/dnssec-ring", "dep:hickory-net", "dep:futures-util"]
 
 [dependencies]
 nano-dns-core.workspace = true
 hickory-proto.workspace = true
+hickory-net = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "time", "io-util"] }
 tracing.workspace = true

@@ -6,6 +6,8 @@
 pub mod error;
 pub mod handler;
 pub mod server;
+#[cfg(any(feature = "dot", feature = "doh"))]
+mod tls;
 
 pub use error::ProtocolError;
 pub use handler::{NanoRequestHandler, RequestLimits};

@@ -3,7 +3,7 @@
 //! Resolution starts at the configured root hints and follows NS referrals
 //! until an authoritative answer is found. CNAME chains are followed, loops
 //! are bounded, and the final response is rewritten for the original client
-//! transaction. DNSSEC validation remains a later phase.
+//! transaction. DNSSEC validation requires forward mode and is not supported here.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -76,7 +76,7 @@ impl RecursiveResolver {
         }
         if config.dnssec {
             return Err(ResolverError::Unsupported(
-                "DNSSEC validation is implemented in a later phase".to_owned(),
+                "DNSSEC validation requires resolver.mode = \"forward\"".to_owned(),
             )
             .into());
         }
@@ -520,6 +520,7 @@ mod tests {
             timeout_ms: 1_000,
             retries: 0,
             dnssec: false,
+            dnssec_trust_anchor: None,
             root_hints: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
             root_port: port,
         }

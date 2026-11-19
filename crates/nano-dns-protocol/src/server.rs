@@ -32,6 +32,10 @@ use crate::handler::{BlockSettings, NanoRequestHandler, RequestLimits};
 /// TCP connection inactivity timeout.
 const TCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// TLS handshake budget for DoT and DoH connections.
+#[cfg(any(feature = "dot", feature = "doh"))]
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Outgoing response slots reserved per TCP connection.
 const TCP_RESPONSE_BUFFER: usize = 128;
 
@@ -42,6 +46,9 @@ pub enum UpstreamResolver {
     /// Recursive mode, available only when compiled with `recursive`.
     #[cfg(feature = "recursive")]
     Recursive(RecursiveResolver),
+    /// DNSSEC-validating forward mode, available only with `dnssec`.
+    #[cfg(feature = "dnssec")]
+    Dnssec(nano_dns_resolver::DnssecResolver),
 }
 
 impl Resolver for UpstreamResolver {
@@ -57,6 +64,8 @@ impl Resolver for UpstreamResolver {
             Self::Forward(resolver) => resolver.resolve(query, context),
             #[cfg(feature = "recursive")]
             Self::Recursive(resolver) => resolver.resolve(query, context),
+            #[cfg(feature = "dnssec")]
+            Self::Dnssec(resolver) => resolver.resolve(query, context),
         }
     }
 }
@@ -84,16 +93,41 @@ impl DnsServer<PipelineResolver> {
             )
             .into());
         }
+        #[cfg(feature = "dnssec")]
+        if config.resolver.dnssec && config.resolver.mode != ResolverMode::Forward {
+            return Err(ProtocolError::Server(
+                "DNSSEC validation requires resolver.mode = \"forward\"".to_owned(),
+            )
+            .into());
+        }
 
         let clients: Vec<_> = config.clients.values().cloned().collect();
         let limits = RequestLimits::from_config(&config.listeners);
-        #[cfg(feature = "recursive")]
+        #[cfg(feature = "dnssec")]
+        let upstream = if config.resolver.dnssec {
+            UpstreamResolver::Dnssec(nano_dns_resolver::DnssecResolver::new(&config.resolver)?)
+        } else if config.resolver.mode == ResolverMode::Recursive {
+            #[cfg(feature = "recursive")]
+            {
+                UpstreamResolver::Recursive(RecursiveResolver::new(&config.resolver)?)
+            }
+            #[cfg(not(feature = "recursive"))]
+            {
+                return Err(ProtocolError::Server(
+                    "recursive mode requires the 'recursive' feature".to_owned(),
+                )
+                .into());
+            }
+        } else {
+            UpstreamResolver::Forward(ForwardResolver::new(&config.resolver)?)
+        };
+        #[cfg(all(not(feature = "dnssec"), feature = "recursive"))]
         let upstream = if config.resolver.mode == ResolverMode::Recursive {
             UpstreamResolver::Recursive(RecursiveResolver::new(&config.resolver)?)
         } else {
             UpstreamResolver::Forward(ForwardResolver::new(&config.resolver)?)
         };
-        #[cfg(not(feature = "recursive"))]
+        #[cfg(all(not(feature = "dnssec"), not(feature = "recursive")))]
         let upstream = UpstreamResolver::Forward(ForwardResolver::new(&config.resolver)?);
         let resolver = if config.dns_cache.enabled {
             CachingResolver::new(upstream, MemoryCache::new(&config.dns_cache))
@@ -152,6 +186,14 @@ impl DnsServer<PipelineResolver> {
         for listener in &config.listeners.entries {
             registered += Self::bind_listener(&mut server, listener).await?;
         }
+        #[cfg(feature = "dot")]
+        {
+            registered += Self::bind_dot_listeners(&mut server, config).await?;
+        }
+        #[cfg(feature = "doh")]
+        {
+            registered += Self::bind_doh_listeners(&mut server, config).await?;
+        }
 
         if registered == 0 {
             return Err(ProtocolError::Server("no listeners were registered".to_owned()).into());
@@ -162,6 +204,92 @@ impl DnsServer<PipelineResolver> {
             storage,
             stats,
         })
+    }
+
+    /// Register TLS listeners for every entry that opts into DoT.
+    #[cfg(feature = "dot")]
+    async fn bind_dot_listeners(
+        server: &mut Server<NanoRequestHandler<PipelineResolver>>,
+        config: &Config,
+    ) -> Result<usize> {
+        if !config.dot.enabled {
+            return Ok(0);
+        }
+        let (Some(cert_path), Some(key_path)) = (
+            config.dot.cert_path.as_deref(),
+            config.dot.key_path.as_deref(),
+        ) else {
+            return Err(
+                ProtocolError::Tls("DoT requires cert_path and key_path".to_owned()).into(),
+            );
+        };
+        let resolver = crate::tls::cert_resolver(cert_path, key_path)?;
+        let tls_config = Arc::new(
+            hickory_server::server::default_tls_server_config(b"dot", resolver)
+                .map_err(|error| ProtocolError::Tls(error.to_string()))?,
+        );
+
+        let mut registered = 0usize;
+        for listener in &config.listeners.entries {
+            if listener.dot {
+                let address = SocketAddr::new(listener.address, config.dot.port);
+                let tcp_listener = TcpListener::bind(address)
+                    .await
+                    .map_err(|source| ProtocolError::Bind { address, source })?;
+                info!(%address, transport = "dot", "DNS listener bound");
+                server
+                    .register_tls_listener_with_tls_config(
+                        tcp_listener,
+                        TLS_HANDSHAKE_TIMEOUT,
+                        Arc::clone(&tls_config),
+                    )
+                    .map_err(|error| ProtocolError::Tls(error.to_string()))?;
+                registered += 1;
+            }
+        }
+        Ok(registered)
+    }
+
+    /// Register HTTP/2 TLS listeners for every entry that opts into DoH.
+    #[cfg(feature = "doh")]
+    async fn bind_doh_listeners(
+        server: &mut Server<NanoRequestHandler<PipelineResolver>>,
+        config: &Config,
+    ) -> Result<usize> {
+        if !config.doh.enabled {
+            return Ok(0);
+        }
+        let (Some(cert_path), Some(key_path)) = (
+            config.doh.cert_path.as_deref(),
+            config.doh.key_path.as_deref(),
+        ) else {
+            return Err(
+                ProtocolError::Tls("DoH requires cert_path and key_path".to_owned()).into(),
+            );
+        };
+        let resolver = crate::tls::cert_resolver(cert_path, key_path)?;
+
+        let mut registered = 0usize;
+        for listener in &config.listeners.entries {
+            if listener.doh {
+                let address = SocketAddr::new(listener.address, config.doh.port);
+                let tcp_listener = TcpListener::bind(address)
+                    .await
+                    .map_err(|source| ProtocolError::Bind { address, source })?;
+                info!(%address, transport = "doh", "DNS listener bound");
+                server
+                    .register_https_listener(
+                        tcp_listener,
+                        TLS_HANDSHAKE_TIMEOUT,
+                        Arc::clone(&resolver),
+                        None,
+                        config.doh.path.clone(),
+                    )
+                    .map_err(|error| ProtocolError::Tls(error.to_string()))?;
+                registered += 1;
+            }
+        }
+        Ok(registered)
     }
 }
 

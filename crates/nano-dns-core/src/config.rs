@@ -168,8 +168,11 @@ pub struct ResolverConfig {
     pub timeout_ms: u64,
     /// Number of retries per query.
     pub retries: u8,
-    /// Validate DNSSEC responses (Fase 11).
+    /// Validate DNSSEC responses.
     pub dnssec: bool,
+    /// Optional trust anchor file (DNSKEY presentation format) used for validation.
+    #[serde(default)]
+    pub dnssec_trust_anchor: Option<PathBuf>,
     /// Root hints used in recursive mode.
     pub root_hints: Vec<IpAddr>,
     /// UDP/TCP port used for root hint servers.
@@ -189,6 +192,7 @@ impl Default for ResolverConfig {
             timeout_ms: 2_000,
             retries: 2,
             dnssec: false,
+            dnssec_trust_anchor: None,
             root_hints: Vec::new(),
             root_port: default_root_port(),
         }
@@ -436,6 +440,8 @@ impl Default for WebConfig {
 pub struct DotConfig {
     /// Whether DoT is enabled at runtime.
     pub enabled: bool,
+    /// TCP port used by every listener that opts into DoT.
+    pub port: u16,
     /// Path to the PEM certificate chain.
     pub cert_path: Option<PathBuf>,
     /// Path to the PEM private key.
@@ -446,6 +452,7 @@ impl Default for DotConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            port: 853,
             cert_path: None,
             key_path: None,
         }
@@ -458,6 +465,8 @@ impl Default for DotConfig {
 pub struct DohConfig {
     /// Whether DoH is enabled at runtime.
     pub enabled: bool,
+    /// TCP port used by every listener that opts into DoH.
+    pub port: u16,
     /// HTTPS path used for DNS queries.
     pub path: String,
     /// Path to the PEM certificate chain.
@@ -470,6 +479,7 @@ impl Default for DohConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            port: 443,
             path: "/dns-query".to_owned(),
             cert_path: None,
             key_path: None,
@@ -592,6 +602,16 @@ impl Config {
                 }
                 IpVersion::Both | IpVersion::V4 | IpVersion::V6 => {}
             }
+            if listener.dot && !self.dot.enabled {
+                return Err(ConfigError::Validation(format!(
+                    "listeners.entries[{index}] requests DoT but dot.enabled is false"
+                )));
+            }
+            if listener.doh && !self.doh.enabled {
+                return Err(ConfigError::Validation(format!(
+                    "listeners.entries[{index}] requests DoH but doh.enabled is false"
+                )));
+            }
         }
 
         if self.listeners.max_packet_bytes < 512 || self.listeners.max_packet_bytes > 65_535 {
@@ -645,6 +665,21 @@ impl Config {
         if self.resolver.dnssec && !features.dnssec {
             return Err(ConfigError::Validation(
                 "DNSSEC requested but the binary was built without the 'dnssec' feature".to_owned(),
+            ));
+        }
+        if self.resolver.dnssec && self.resolver.mode != ResolverMode::Forward {
+            return Err(ConfigError::Validation(
+                "DNSSEC validation requires resolver.mode = \"forward\"".to_owned(),
+            ));
+        }
+        if self.resolver.dnssec_trust_anchor.is_some() && !features.dnssec {
+            return Err(ConfigError::Validation(
+                "resolver.dnssec_trust_anchor requires the 'dnssec' feature".to_owned(),
+            ));
+        }
+        if self.resolver.dnssec_trust_anchor.is_some() && !self.resolver.dnssec {
+            return Err(ConfigError::Validation(
+                "resolver.dnssec_trust_anchor requires resolver.dnssec to be enabled".to_owned(),
             ));
         }
 
@@ -726,19 +761,39 @@ impl Config {
                     .to_owned(),
             ));
         }
-        if self.dot.enabled
-            && (!features.dot || self.dot.cert_path.is_none() || self.dot.key_path.is_none())
-        {
-            return Err(ConfigError::Validation(
-                "DoT requires the 'dot' feature and both cert_path and key_path".to_owned(),
-            ));
+        if self.dot.enabled {
+            if !features.dot || self.dot.cert_path.is_none() || self.dot.key_path.is_none() {
+                return Err(ConfigError::Validation(
+                    "DoT requires the 'dot' feature and both cert_path and key_path".to_owned(),
+                ));
+            }
+            if self.dot.port == 0 {
+                return Err(ConfigError::Validation(
+                    "dot.port must be greater than zero".to_owned(),
+                ));
+            }
+            if !self.listeners.entries.iter().any(|entry| entry.dot) {
+                return Err(ConfigError::Validation(
+                    "dot.enabled requires at least one listener with dot = true".to_owned(),
+                ));
+            }
         }
-        if self.doh.enabled
-            && (!features.doh || self.doh.cert_path.is_none() || self.doh.key_path.is_none())
-        {
-            return Err(ConfigError::Validation(
-                "DoH requires the 'doh' feature and both cert_path and key_path".to_owned(),
-            ));
+        if self.doh.enabled {
+            if !features.doh || self.doh.cert_path.is_none() || self.doh.key_path.is_none() {
+                return Err(ConfigError::Validation(
+                    "DoH requires the 'doh' feature and both cert_path and key_path".to_owned(),
+                ));
+            }
+            if self.doh.port == 0 {
+                return Err(ConfigError::Validation(
+                    "doh.port must be greater than zero".to_owned(),
+                ));
+            }
+            if !self.listeners.entries.iter().any(|entry| entry.doh) {
+                return Err(ConfigError::Validation(
+                    "doh.enabled requires at least one listener with doh = true".to_owned(),
+                ));
+            }
         }
         if !self.doh.path.starts_with('/') || self.doh.path.len() < 2 {
             return Err(ConfigError::Validation(
@@ -902,6 +957,34 @@ mod tests {
     }
 
     #[test]
+    fn dnssec_requires_feature_forward_mode_and_consistent_trust_anchor() {
+        let mut all = features();
+        all.dnssec = true;
+        all.recursive = true;
+
+        let mut config = Config::default();
+        config.resolver.dnssec = true;
+        config.validate(&all).expect("DNSSEC forward mode is valid");
+
+        config.resolver.mode = ResolverMode::Recursive;
+        config
+            .resolver
+            .root_hints
+            .push(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(config.validate(&all).is_err());
+
+        config.resolver.mode = ResolverMode::Forward;
+        config.resolver.dnssec_trust_anchor = Some(PathBuf::from("anchors/dnskey.txt"));
+        config.validate(&all).expect("custom trust anchor is valid");
+
+        config.resolver.dnssec = false;
+        assert!(config.validate(&all).is_err());
+
+        config.resolver.dnssec = true;
+        assert!(config.validate(&features()).is_err());
+    }
+
+    #[test]
     fn disabled_features_are_rejected_at_validation() {
         let mut config = Config::default();
         config.storage.enabled = true;
@@ -961,6 +1044,67 @@ mod tests {
                 denylist: Vec::new(),
             },
         );
+        assert!(config.validate(&features()).is_err());
+    }
+
+    #[test]
+    fn dot_requires_feature_paths_and_opt_in() {
+        let mut all = features();
+        all.dot = true;
+        let mut config = Config::default();
+        config.dot.enabled = true;
+        config.dot.cert_path = Some(PathBuf::from("cert.pem"));
+        config.dot.key_path = Some(PathBuf::from("cert.key"));
+        // No listener opts into DoT yet.
+        assert!(config.validate(&all).is_err());
+
+        config.listeners.entries[0].dot = true;
+        config.validate(&all).expect("valid DoT configuration");
+
+        // Missing feature is rejected even with complete paths.
+        assert!(config.validate(&features()).is_err());
+
+        // Missing paths are rejected with the feature enabled.
+        config.dot.key_path = None;
+        assert!(config.validate(&all).is_err());
+
+        // A zero port is invalid.
+        config.dot.key_path = Some(PathBuf::from("cert.key"));
+        config.dot.port = 0;
+        assert!(config.validate(&all).is_err());
+    }
+
+    #[test]
+    fn doh_requires_feature_paths_opt_in_and_absolute_path() {
+        let mut all = features();
+        all.doh = true;
+        let mut config = Config::default();
+        config.doh.enabled = true;
+        config.doh.cert_path = Some(PathBuf::from("cert.pem"));
+        config.doh.key_path = Some(PathBuf::from("cert.key"));
+        assert!(config.validate(&all).is_err());
+
+        config.listeners.entries[0].doh = true;
+        config.validate(&all).expect("valid DoH configuration");
+
+        assert!(config.validate(&features()).is_err());
+
+        config.doh.path = "dns-query".to_owned();
+        assert!(config.validate(&all).is_err());
+
+        config.doh.path = "/dns-query".to_owned();
+        config.doh.port = 0;
+        assert!(config.validate(&all).is_err());
+    }
+
+    #[test]
+    fn listener_cannot_request_disabled_transports() {
+        let mut config = Config::default();
+        config.listeners.entries[0].dot = true;
+        assert!(config.validate(&features()).is_err());
+
+        config.listeners.entries[0].dot = false;
+        config.listeners.entries[0].doh = true;
         assert!(config.validate(&features()).is_err());
     }
 

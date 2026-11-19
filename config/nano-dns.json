@@ -29,6 +29,7 @@
     "timeout_ms": 2000,
     "retries": 2,
     "dnssec": false,
+    "dnssec_trust_anchor": null,
     "root_hints": [],
     "root_port": 53
   },
@@ -78,11 +79,13 @@
   },
   "dot": {
     "enabled": false,
+    "port": 853,
     "cert_path": null,
     "key_path": null
   },
   "doh": {
     "enabled": false,
+    "port": 443,
     "path": "/dns-query",
     "cert_path": null,
     "key_path": null

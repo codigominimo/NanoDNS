@@ -26,9 +26,9 @@ const DEFAULT_UDP_PAYLOAD: u16 = 1232;
 
 /// One configured upstream resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UpstreamTarget {
-    address: SocketAddr,
-    tcp_only: bool,
+pub(crate) struct UpstreamTarget {
+    pub(crate) address: SocketAddr,
+    pub(crate) tcp_only: bool,
 }
 
 /// DNS forwarder backed by one or more upstream resolvers.
@@ -50,7 +50,7 @@ impl ForwardResolver {
         }
         if config.dnssec {
             return Err(ResolverError::Unsupported(
-                "DNSSEC validation is implemented in a later phase".to_owned(),
+                "DNSSEC validation is provided by DnssecResolver, not ForwardResolver".to_owned(),
             )
             .into());
         }
@@ -142,7 +142,7 @@ async fn resolve_with_upstreams(
 }
 
 /// Reject responses that do not answer the original question.
-fn validate_response(
+pub(crate) fn validate_response(
     message: &Message,
     query: &DnsQuery,
     address: SocketAddr,
@@ -194,6 +194,7 @@ mod tests {
             timeout_ms: 2_000,
             retries: 2,
             dnssec: false,
+            dnssec_trust_anchor: None,
             root_hints: Vec::new(),
             root_port: 53,
         }

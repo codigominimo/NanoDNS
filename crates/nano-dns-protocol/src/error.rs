@@ -19,6 +19,9 @@ pub enum ProtocolError {
     /// Graceful shutdown failed.
     #[error("DNS server shutdown failed: {0}")]
     Shutdown(String),
+    /// TLS certificate material could not be loaded.
+    #[error("TLS setup failed: {0}")]
+    Tls(String),
 }
 
 impl From<ProtocolError> for nano_dns_core::error::Error {

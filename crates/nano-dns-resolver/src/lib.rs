@@ -8,9 +8,13 @@ pub mod forwarder;
 pub(crate) mod response;
 pub(crate) mod transport;
 
+#[cfg(feature = "dnssec")]
+pub mod dnssec;
 #[cfg(feature = "recursive")]
 pub mod recursive;
 
+#[cfg(feature = "dnssec")]
+pub use dnssec::DnssecResolver;
 pub use error::ResolverError;
 pub use forwarder::ForwardResolver;
 #[cfg(feature = "recursive")]

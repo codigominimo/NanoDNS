@@ -2,7 +2,7 @@
 
 NanoDNS es un servidor DNS modular y de consumo mínimo escrito en Rust. No es un clon de Pi-hole: su arquitectura separa el protocolo, la resolución, la caché, el filtrado y las integraciones opcionales detrás de interfaces propias.
 
-Estado actual: **Fase 10 completada** (workspace, configuración, errores, modelos, interfaces, ciclo de vida, servidor DNS UDP/TCP, resolver forwarder, resolver recursivo iterativo, caché DNS en memoria, bloqueo por listas, persistencia SQLite opcional, estadísticas en memoria, API REST opcional, capa HTTP compartida y panel web opcional). DoH y DoT llegarán en fases posteriores.
+Estado actual: **Fase 12 completada** (workspace, configuración, errores, modelos, interfaces, ciclo de vida, servidor DNS UDP/TCP, resolver forwarder, resolver recursivo iterativo, caché DNS en memoria, bloqueo por listas, persistencia SQLite opcional, estadísticas en memoria, API REST opcional, capa HTTP compartida, panel web opcional, DNS sobre TLS/HTTPS opcional y validación DNSSEC opcional).
 
 ## Requisitos
 
@@ -15,8 +15,8 @@ Estado actual: **Fase 10 completada** (workspace, configuración, errores, model
 crates/
   nano-dns-core/     configuración, errores, modelos, interfaces, runtime
   nano-dns/          ejecutable y ciclo de vida
-  nano-dns-protocol/ UDP/TCP, validación de mensajes y control de acceso
-  nano-dns-resolver/ forwarder y resolver iterativo (feature `recursive`)
+  nano-dns-protocol/ UDP/TCP, DoT/DoH, validación de mensajes y control de acceso
+  nano-dns-resolver/ forwarder, resolver iterativo (feature `recursive`) y validador DNSSEC (feature `dnssec`)
   nano-dns-cache/    caché DNS en memoria y decorador de resolver
   nano-dns-blocker/  listas de dominios y reglas de filtrado
   nano-dns-storage/  persistencia SQLite opcional (feature `sqlite`)
@@ -32,7 +32,7 @@ tests/
 
 Los crates de fases futuras se crearán cuando tengan una implementación real, para evitar módulos vacíos.
 
-## Uso (Fase 10)
+## Uso (Fase 12)
 
 ```powershell
 cargo run -p nano-dns -- --config config/nano-dns.json --check-config
@@ -46,7 +46,7 @@ Cuando `dns_cache.enabled` es `true`, las respuestas se guardan en una caché LR
 
 Cuando `blocker.enabled` es `true`, las consultas se evalúan contra `denylist`, `allowlist`, listas locales y reglas por cliente antes de la resolución. El allowlist global y el de cliente tienen prioridad sobre el denylist. La respuesta se elige con `blocker.block_response`: `NXDOMAIN`, `NODATA` o `SINKHOLE` (usando `sinkhole_v4`/`sinkhole_v6`). Las listas remotas no se descargan; una fuente con esquema URL se rechaza en el arranque.
 
-Con `resolver.mode = "recursive"` y la feature `recursive` activada, NanoDNS resuelve desde `resolver.root_hints` sin depender de un forwarder: sigue delegaciones NS, usa glue cuando está disponible, resuelve nombres de servidores sin glue, sigue cadenas CNAME y devuelve la respuesta autoritativa con el id original del cliente. `resolver.root_port` permite usar puertos altos en pruebas; en producción suele ser `53`. DNSSEC todavía no se valida: la configuración que lo solicita se rechaza con un error claro.
+Con `resolver.mode = "recursive"` y la feature `recursive` activada, NanoDNS resuelve desde `resolver.root_hints` sin depender de un forwarder: sigue delegaciones NS, usa glue cuando está disponible, resuelve nombres de servidores sin glue, sigue cadenas CNAME y devuelve la respuesta autoritativa con el id original del cliente. `resolver.root_port` permite usar puertos altos en pruebas; en producción suele ser `53`. DNSSEC no se valida en modo recursivo: la combinación se rechaza con un error claro.
 
 Con `storage.enabled = true` y la feature `sqlite` activada, NanoDNS crea el esquema en `storage.path` y registra consultas completadas. Si `storage.history = true`, cada consulta permitida o bloqueada se guarda con cliente, transporte, dominio, tipo/clase, decisión, código de respuesta y TTL. El handler solo encola un evento: un hilo escritor agrupa los registros en transacciones SQLite y el apagado graceful vacía la cola antes de terminar. Si el historial está desactivado, se crea la base de datos pero no se almacenan eventos por consulta.
 
@@ -56,7 +56,11 @@ Con `api.enabled = true` y la feature `api` activada, NanoDNS expone una API RES
 
 Con `web.enabled = true` y la feature `web` activada, NanoDNS sirve un panel HTML de solo lectura en `web.listen:web.port`. Muestra estado, uptime, modo de resolución y, si las estadísticas están activadas, contadores y desgloses por código de respuesta, tipo, transporte y dominios más consultados. El panel es siempre loopback-only: `WebConfig` no expone lista de redes, y el peer del socket debe ser `127.0.0.0/8` o `::1/128`. Las rutas son `/` (panel) y `/health` (texto plano). Todo valor dinámico se escapa antes de renderizar.
 
-> En Linux, enlazar el puerto 53 puede requerir privilegios. Usa puertos altos en pruebas o ejecuta el proceso con la capacitación correspondiente.
+Con `dot.enabled = true` y la feature `dot` activada, NanoDNS sirve DNS sobre TLS en `dot.port` (853 por defecto) para cada listener con `dot: true`. El certificado y la clave PEM se cargan de `dot.cert_path` y `dot.key_path`. Con `doh.enabled = true` y la feature `doh` activada, sirve DNS sobre HTTPS (HTTP/2) en `doh.port` (443 por defecto) para cada listener con `doh: true`, usando `doh.path` como ruta de consulta y `doh.cert_path`/`doh.key_path` para TLS. En ambos casos se reutiliza el mismo handler, caché, filtrado, estadísticas y control de acceso por red que en UDP/TCP; la identidad del cliente se toma del peer del socket TLS, nunca de cabeceras. Un listener no puede pedir DoT/DoH si la sección correspondiente está desactivada, y la configuración con `enabled = true` sin certificado, clave o listener que opte por el transporte se rechaza en el arranque.
+
+Con `resolver.dnssec = true` y la feature `dnssec` activada, NanoDNS valida las respuestas del upstream antes de servirlas: verifica DNSKEY/DS/RRSIG y las pruebas NSEC/NSEC3 de respuestas negativas siguiendo la cadena de confianza hasta las anclas raíz incluidas en Hickory, o hasta un archivo propio de anclas en `resolver.dnssec_trust_anchor` (registros DNSKEY en formato de presentación). Solo se admite junto con `resolver.mode = "forward"`. Las respuestas válidas se devuelven con el flag AD (`authentic_data`); las bogus o sin prueba de seguridad se convierten en `SERVFAIL`. La validación usa el mismo UDP/TCP del forwarder, no añade `hickory-resolver` y no se compila cuando la feature está desactivada.
+
+> En Linux, enlazar los puertos 53, 853 o 443 puede requerir privilegios. Usa puertos altos en pruebas o ejecuta el proceso con la capacitación correspondiente.
 
 ## Cargo features
 
@@ -69,7 +73,7 @@ cargo check -p nano-dns
 cargo check -p nano-dns --no-default-features
 ```
 
-La configuración se valida contra las features compiladas: si el JSON solicita SQLite, estadísticas, recursive, API, bloqueo, etc. y la feature no está activa, el arranque falla con un error claro antes de abrir sockets. Las features `blocker`, `recursive`, `sqlite`, `statistics`, `api` y `web` también controlan sus dependencias de código: sin ellas, el filtrado, el resolver iterativo, el escritor SQLite, el collector de estadísticas, el servidor HTTP o el panel web no se compilan en el ejecutable.
+La configuración se valida contra las features compiladas: si el JSON solicita SQLite, estadísticas, recursive, API, bloqueo, DoH, DoT, DNSSEC, etc. y la feature no está activa, el arranque falla con un error claro antes de abrir sockets. Las features `blocker`, `recursive`, `sqlite`, `statistics`, `api`, `web`, `dot`, `doh` y `dnssec` también controlan sus dependencias de código: sin ellas, el filtrado, el resolver iterativo, el validador DNSSEC, el escritor SQLite, el collector de estadísticas, el servidor HTTP, el panel web ni las pilas TLS/HTTPS no se compilan en el ejecutable.
 
 ## Decisiones técnicas de la Fase 1
 
@@ -136,7 +140,7 @@ La configuración se valida contra las features compiladas: si el JSON solicita 
 - UDP reintenta por TCP cuando la respuesta está truncada; los reintentos y el timeout usan la configuración existente.
 - `resolver.root_port` permite probar con puertos altos sin privilegios.
 - El pipeline usa un enum `UpstreamResolver` para seleccionar forwarder o recursivo sin objetos trait ni GATs complejos; la caché y el handler no cambian.
-- DNSSEC sigue sin implementarse y se rechaza explícitamente en la validación.
+- DNSSEC no formaba parte de esta fase y se rechazaba explícitamente en la validación; la Fase 12 lo añade como feature opcional.
 
 ## Decisiones técnicas de la Fase 7
 
@@ -179,6 +183,28 @@ La configuración se valida contra las features compiladas: si el JSON solicita 
 - El panel reutiliza el mismo `Arc<dyn StatsSink>` que la API y el handler DNS, sin copias ni hilos adicionales.
 - Las respuestas usan `Content-Type` explícito y `X-Content-Type-Options: nosniff`; solo se acepta `GET` y una petición por conexión.
 
+## Decisiones técnicas de la Fase 11
+
+- DoT y DoH usan los listeners nativos de `hickory-server` (`register_tls_listener_with_tls_config` y `register_https_listener`) con ALPN `dot` y `h2` respectivamente.
+- Las features `dot` y `doh` activan solo los flags TLS/HTTPS de Hickory y la dependencia rustls cuando se compilan; la build mínima no arrastra TLS.
+- El material PEM se carga con `rustls`: se rechazan certificados vacíos, claves ilegibles y pares certificado/clave inválidos con errores claros antes de abrir sockets.
+- Hickory aplica la misma lista `allowed_networks` a UDP, TCP, DoT y DoH; la IP se toma siempre del peer del socket, nunca de cabeceras DNS ni HTTP.
+- DoT y DoH reutilizan `NanoRequestHandler` sin cambios: filtrado, caché, resolver, historial SQLite y estadísticas funcionan igual en los cuatro transportes.
+- Un timeout de handshake TLS acota los connection attempts lentos o maliciosos.
+- Las pruebas generan certificados autofirmados en tiempo de ejecución con `rcgen` (dev-dependency) y clientes TLS reales, sin guardar claves privadas en el repositorio.
+- Las pruebas usan puertos altos efímeros para no colisionar con los listeners fijos de otras suites.
+
+## Decisiones técnicas de la Fase 12
+
+- La validación DNSSEC se implementa en `nano-dns-resolver` detrás de la feature `dnssec`; `nano-dns-core` sigue sin depender de Hickory.
+- Se reutiliza `DnssecDnsHandle` de `hickory-net` con un `DnsHandle` propio que envía los mensajes por el transporte UDP/TCP existente del forwarder.
+- La feature `dnssec` activa únicamente `hickory-net/dnssec-ring` y las utilidades de futures necesarias; sin ella no se compila código criptográfico DNSSEC adicional.
+- El validador sigue la cadena de confianza completa (DNSKEY, DS, RRSIG, NSEC/NSEC3) y rechaza respuestas bogus o sin prueba de insecurity con `SERVFAIL`.
+- El flag AD se activa solo cuando el resumen DNSSEC de las respuestas es `Secure`, de modo que los clientes distingan datos autenticados de datos reenviados sin validar.
+- `resolver.dnssec_trust_anchor` permite sustituir las anclas raíz por un archivo DNSKEY local, útil para pruebas y despliegues aislados.
+- DNSSEC solo se admite en modo forward; la combinación con recursive se rechaza en la validación de configuración.
+- Las pruebas usan un stub DNSSEC firmado en un puerto alto efímero, claves Ed25519 generadas en tiempo de ejecución y anclas temporales: no se guardan claves privadas en el repositorio.
+
 ## Verificación
 
 ```powershell
@@ -188,6 +214,7 @@ cargo test --workspace
 cargo check --workspace --all-features
 cargo test --workspace --all-features
 cargo check -p nano-dns --no-default-features
+cargo check -p nano-dns --no-default-features --features dnssec
 cargo check -p nano-dns --no-default-features --features forward,blocker,recursive,sqlite,statistics,api,web,doh,dot,dnssec
 ```
 

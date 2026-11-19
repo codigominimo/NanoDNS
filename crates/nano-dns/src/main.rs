@@ -1,7 +1,8 @@
 //! NanoDNS executable entry point.
 //!
-//! Loads configuration, starts UDP/TCP DNS listeners and the optional REST API
-//! and web dashboard, then coordinates graceful shutdown across all servers.
+//! Loads configuration, starts UDP/TCP DNS listeners and the optional DoT, DoH,
+//! REST API and web dashboard, then coordinates graceful shutdown across all
+//! servers.
 
 use std::path::PathBuf;
 

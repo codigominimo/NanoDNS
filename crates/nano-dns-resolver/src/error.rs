@@ -39,6 +39,9 @@ pub enum ResolverError {
     /// The validated response could not be re-encoded.
     #[error("cannot encode upstream response: {0}")]
     Encode(String),
+    /// DNSSEC validation failed for a response.
+    #[error("DNSSEC validation failed: {0}")]
+    Dnssec(String),
 }
 
 impl From<ResolverError> for nano_dns_core::error::Error {
