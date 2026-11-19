@@ -3,8 +3,6 @@
 //! Certificates are generated at runtime with `rcgen`, so no private keys are
 //! stored in the repository and the tests never depend on external tools.
 
-#![cfg(all(feature = "dot", feature = "doh"))]
-
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -81,9 +79,17 @@ impl Drop for TestCerts {
     }
 }
 
+/// Find a port usable by both UDP and TCP. Windows can reserve ranges for one
+/// transport only, so a TCP-only probe can return a port the UDP listener cannot bind.
 fn free_port() -> u16 {
-    let socket = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("free port");
-    socket.local_addr().expect("local address").port()
+    for _ in 0..64 {
+        let udp = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("free UDP port");
+        let port = udp.local_addr().expect("UDP local address").port();
+        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no port is free for both UDP and TCP");
 }
 
 fn query(id: u16) -> Vec<u8> {

@@ -1,6 +1,6 @@
 [package]
 name = "nano-dns-storage"
-description = "Optional SQLite persistence for NanoDNS"
+description = "SQLite persistence for NanoDNS"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

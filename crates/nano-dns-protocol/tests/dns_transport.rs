@@ -2,17 +2,18 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, Metadata, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{
-    Name, RData, Record, RecordType,
-    rdata::{A, NS},
-};
+use hickory_proto::rr::rdata::NS;
+use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::A};
 use ipnet::{IpNet, Ipv4Net};
+use nano_dns_core::blocker::{BlockListKind, BlockerControl};
+use nano_dns_core::config::ResolverMode;
 use nano_dns_core::config::{
-    BlockResponse, Config, IpVersion, ListenerConfig, ResolverConfig, ResolverMode, Upstream,
+    BlockResponse, Config, IpVersion, ListenerConfig, ResolverConfig, Upstream,
 };
 use nano_dns_protocol::DnsServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,9 +21,18 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+/// Find a port usable by both UDP and TCP. The upstream stub and the DNS server
+/// bind both transports on the same port, and Windows can reserve ranges for
+/// only one of them.
 fn free_udp_port() -> u16 {
-    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("free UDP port");
-    socket.local_addr().expect("UDP local address").port()
+    for _ in 0..64 {
+        let udp = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("free UDP port");
+        let port = udp.local_addr().expect("UDP local address").port();
+        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no port is free for both UDP and TCP");
 }
 
 fn config(udp_port: u16, tcp_port: u16, upstream_port: u16, tcp_only: bool) -> Config {
@@ -215,6 +225,29 @@ async fn start_server(
     (shutdown_tx, task)
 }
 
+/// Variant of `start_server` that also returns the shared blocker control.
+async fn start_server_with_control(
+    config: &Config,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<nano_dns_core::error::Result<()>>,
+    Arc<dyn BlockerControl>,
+) {
+    let mut server = DnsServer::bind(config).await.expect("server must bind");
+    let control = server
+        .blocker_control()
+        .expect("blocker control must be available");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        server
+            .serve_with_signal(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    (shutdown_tx, task, control)
+}
+
 async fn stop_server(
     shutdown_tx: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<nano_dns_core::error::Result<()>>,
@@ -402,7 +435,71 @@ async fn nodata_and_sinkhole_responses_are_configurable() {
     stop_server(shutdown_tx, task).await;
 }
 
-#[cfg(feature = "recursive")]
+#[tokio::test]
+async fn blocker_toggle_and_runtime_rules_take_effect_immediately() {
+    let upstream_queries = Arc::new(AtomicUsize::new(0));
+    let upstream_port = spawn_upstream_counted(false, Arc::clone(&upstream_queries)).await;
+    let udp_port = free_udp_port();
+    let tcp_port = free_udp_port();
+    let mut config = config(udp_port, tcp_port, upstream_port, false);
+    config.blocker.enabled = true;
+    config.blocker.denylist = vec!["ads.example.com".to_owned()];
+    config.dns_cache.enabled = false;
+    let (shutdown_tx, task, control) = start_server_with_control(&config).await;
+
+    udp_query(
+        udp_port,
+        named_query(20, "ads.example.com."),
+        20,
+        ResponseCode::NXDomain,
+        0,
+    )
+    .await;
+    assert_eq!(upstream_queries.load(Ordering::SeqCst), 0);
+
+    control.set_enabled(false);
+    udp_query(
+        udp_port,
+        named_query(21, "ads.example.com."),
+        21,
+        ResponseCode::NoError,
+        1,
+    )
+    .await;
+    assert!(upstream_queries.load(Ordering::SeqCst) > 0);
+
+    control.set_enabled(true);
+    control
+        .add_domains(BlockListKind::Deny, "tracker.example.net")
+        .expect("runtime deny rule");
+    udp_query(
+        udp_port,
+        named_query(22, "www.tracker.example.net."),
+        22,
+        ResponseCode::NXDomain,
+        0,
+    )
+    .await;
+
+    control
+        .remove_domain(BlockListKind::Deny, "tracker.example.net")
+        .expect("remove deny rule");
+    udp_query(
+        udp_port,
+        named_query(23, "www.tracker.example.net."),
+        23,
+        ResponseCode::NoError,
+        1,
+    )
+    .await;
+
+    let snapshot = control.snapshot();
+    assert!(snapshot.enabled);
+    assert!(snapshot.total_blocked >= 2);
+
+    stop_server(shutdown_tx, task).await;
+}
+
 async fn spawn_recursive_stub(
     address: Ipv4Addr,
     port: u16,
@@ -429,7 +526,6 @@ async fn spawn_recursive_stub(
     });
 }
 
-#[cfg(feature = "recursive")]
 #[tokio::test]
 async fn recursive_mode_resolves_from_root_hints() {
     let root_port = free_udp_port();
@@ -480,7 +576,6 @@ async fn recursive_mode_resolves_from_root_hints() {
     stop_server(shutdown_tx, task).await;
 }
 
-#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_history_records_completed_queries() {
     static NEXT_DB: AtomicU64 = AtomicU64::new(0);
@@ -526,7 +621,6 @@ async fn sqlite_history_records_completed_queries() {
     let _ = std::fs::remove_file(database.with_extension("sqlite3-shm"));
 }
 
-#[cfg(feature = "statistics")]
 #[tokio::test]
 async fn statistics_records_completed_queries() {
     let upstream_port = spawn_upstream(false).await;

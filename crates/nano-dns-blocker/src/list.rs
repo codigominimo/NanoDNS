@@ -24,6 +24,30 @@ impl DomainSet {
         }
     }
 
+    /// Whether an exact normalized domain is present.
+    pub(crate) fn contains(&self, domain: &str) -> bool {
+        let domain = normalize(domain);
+        self.domains.iter().any(|entry| entry == &domain)
+    }
+
+    /// Remove a domain. Returns `true` when an entry was removed.
+    pub(crate) fn remove(&mut self, domain: &str) -> bool {
+        let domain = normalize(domain);
+        let before = self.domains.len();
+        self.domains.retain(|entry| entry != &domain);
+        self.domains.len() != before
+    }
+
+    /// Return every entry in insertion order.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &str> {
+        self.domains.iter().map(String::as_str)
+    }
+
+    /// Number of entries in the set.
+    pub(crate) fn len(&self) -> usize {
+        self.domains.len()
+    }
+
     /// Whether `name` is this domain or a subdomain of an entry.
     pub(crate) fn matches(&self, name: &str) -> bool {
         let name = normalize(name);
@@ -66,7 +90,7 @@ pub(crate) fn parse_list(text: &str) -> Vec<String> {
                 line
             };
             let domain = normalize(token);
-            if domain.is_empty() || !domain.contains('.') {
+            if domain.is_empty() || !domain.contains('.') || domain.contains("://") {
                 return None;
             }
             Some(domain)
@@ -114,5 +138,57 @@ localhost
         assert!(domains.contains(&"phishing.example.org".to_owned()));
         assert!(!domains.iter().any(|domain| domain == "localhost"));
         assert!(!domains.iter().any(|domain| domain.contains("exception")));
+    }
+
+    #[test]
+    fn domain_set_supports_contains_remove_entries_and_len() {
+        let mut set = DomainSet::default();
+        set.insert("Ads.Example.COM.");
+        set.insert("ads.example.com");
+        set.insert("");
+        set.insert("localhost");
+
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set.entries().collect::<Vec<_>>(),
+            vec!["ads.example.com", "localhost"]
+        );
+        assert!(set.contains("ADS.EXAMPLE.COM."));
+        assert!(set.remove("*.ads.example.com"));
+        assert!(!set.remove("ads.example.com"));
+        assert!(set.contains("localhost"));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn parse_list_accepts_ipv6_hosts_and_inline_comments() {
+        let domains = parse_list("::1 tracker.example.net # local\n0.0.0.0  ads.example.com\n");
+        assert_eq!(
+            domains,
+            vec![
+                "tracker.example.net".to_owned(),
+                "ads.example.com".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_list_ignores_urls_and_non_domain_tokens() {
+        let domains = parse_list(
+            "https://tracker.example.net\n\
+             not-a-domain\n\
+             \n\
+             [Adblock Plus 2.0]\n",
+        );
+        assert!(domains.is_empty());
+    }
+
+    #[test]
+    fn parse_list_normalizes_wildcard_adblock_and_leading_dot_forms() {
+        let domains = parse_list("||ADS.Example.COM^\n*.Track.Example.NET\n.Lead.Example.ORG");
+        assert_eq!(domains.len(), 3);
+        assert!(domains.contains(&"ads.example.com".to_owned()));
+        assert!(domains.contains(&"track.example.net".to_owned()));
+        assert!(domains.contains(&"lead.example.org".to_owned()));
     }
 }

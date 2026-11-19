@@ -4,11 +4,12 @@
 //! This crate intentionally has no dependency on a concrete DNS protocol
 //! implementation so that external libraries remain replaceable.
 
+pub mod blocker;
 pub mod config;
 pub mod error;
 pub mod model;
 pub mod runtime;
 pub mod traits;
 
-pub use config::{Config, Features};
+pub use config::Config;
 pub use error::{Error, Result};

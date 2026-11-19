@@ -1,7 +1,5 @@
 //! DNSSEC validation tests using a local authoritative stub on an ephemeral port.
 
-#![cfg(feature = "dnssec")]
-
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;

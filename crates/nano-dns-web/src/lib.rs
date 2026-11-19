@@ -1,8 +1,9 @@
 //! Optional server-rendered web dashboard for NanoDNS.
 //!
-//! Serves a read-only overview of status and statistics over the shared
+//! Serves status, statistics and optional ad-blocker controls over the shared
 //! minimal HTTP server. The interface is always restricted to loopback peers
-//! because its configuration exposes no access-control list.
+//! because its configuration exposes no access-control list, and state-changing
+//! requests also require a per-process token rendered in the dashboard.
 
 mod error;
 mod page;

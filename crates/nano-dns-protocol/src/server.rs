@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use hickory_server::Server;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-#[cfg(feature = "blocker")]
 use nano_dns_blocker::DomainBlocker;
 use nano_dns_cache::{CachingResolver, MemoryCache};
+use nano_dns_core::blocker::BlockerControl;
 use nano_dns_core::config::{Config, ListenerConfig, ResolverMode};
 use nano_dns_core::error::Result;
 use nano_dns_core::error::Result as CoreResult;
@@ -17,11 +17,8 @@ use nano_dns_core::model::StatsSnapshot;
 use nano_dns_core::model::{DnsQuery, Response as CoreResponse};
 use nano_dns_core::traits::{Policy, Resolver, StatsSink, Storage};
 use nano_dns_resolver::ForwardResolver;
-#[cfg(feature = "recursive")]
 use nano_dns_resolver::RecursiveResolver;
-#[cfg(feature = "statistics")]
 use nano_dns_stats::StatsCollector;
-#[cfg(feature = "sqlite")]
 use nano_dns_storage::SqliteStorage;
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{info, warn};
@@ -33,7 +30,6 @@ use crate::handler::{BlockSettings, NanoRequestHandler, RequestLimits};
 const TCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// TLS handshake budget for DoT and DoH connections.
-#[cfg(any(feature = "dot", feature = "doh"))]
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Outgoing response slots reserved per TCP connection.
@@ -43,11 +39,9 @@ const TCP_RESPONSE_BUFFER: usize = 128;
 pub enum UpstreamResolver {
     /// Forward mode.
     Forward(ForwardResolver),
-    /// Recursive mode, available only when compiled with `recursive`.
-    #[cfg(feature = "recursive")]
+    /// Recursive mode.
     Recursive(RecursiveResolver),
-    /// DNSSEC-validating forward mode, available only with `dnssec`.
-    #[cfg(feature = "dnssec")]
+    /// DNSSEC-validating forward mode.
     Dnssec(nano_dns_resolver::DnssecResolver),
 }
 
@@ -62,9 +56,7 @@ impl Resolver for UpstreamResolver {
     ) -> Self::Future<'_> {
         match self {
             Self::Forward(resolver) => resolver.resolve(query, context),
-            #[cfg(feature = "recursive")]
             Self::Recursive(resolver) => resolver.resolve(query, context),
-            #[cfg(feature = "dnssec")]
             Self::Dnssec(resolver) => resolver.resolve(query, context),
         }
     }
@@ -81,19 +73,12 @@ where
     server: Server<NanoRequestHandler<R>>,
     storage: Option<Arc<dyn Storage>>,
     stats: Option<Arc<dyn StatsSink>>,
+    blocker: Option<Arc<dyn BlockerControl>>,
 }
 
 impl DnsServer<PipelineResolver> {
     /// Bind and register every configured UDP/TCP listener.
     pub async fn bind(config: &Config) -> Result<Self> {
-        #[cfg(not(feature = "recursive"))]
-        if config.resolver.mode == ResolverMode::Recursive {
-            return Err(ProtocolError::Server(
-                "recursive mode requires the 'recursive' feature".to_owned(),
-            )
-            .into());
-        }
-        #[cfg(feature = "dnssec")]
         if config.resolver.dnssec && config.resolver.mode != ResolverMode::Forward {
             return Err(ProtocolError::Server(
                 "DNSSEC validation requires resolver.mode = \"forward\"".to_owned(),
@@ -103,70 +88,41 @@ impl DnsServer<PipelineResolver> {
 
         let clients: Vec<_> = config.clients.values().cloned().collect();
         let limits = RequestLimits::from_config(&config.listeners);
-        #[cfg(feature = "dnssec")]
         let upstream = if config.resolver.dnssec {
             UpstreamResolver::Dnssec(nano_dns_resolver::DnssecResolver::new(&config.resolver)?)
         } else if config.resolver.mode == ResolverMode::Recursive {
-            #[cfg(feature = "recursive")]
-            {
-                UpstreamResolver::Recursive(RecursiveResolver::new(&config.resolver)?)
-            }
-            #[cfg(not(feature = "recursive"))]
-            {
-                return Err(ProtocolError::Server(
-                    "recursive mode requires the 'recursive' feature".to_owned(),
-                )
-                .into());
-            }
-        } else {
-            UpstreamResolver::Forward(ForwardResolver::new(&config.resolver)?)
-        };
-        #[cfg(all(not(feature = "dnssec"), feature = "recursive"))]
-        let upstream = if config.resolver.mode == ResolverMode::Recursive {
             UpstreamResolver::Recursive(RecursiveResolver::new(&config.resolver)?)
         } else {
             UpstreamResolver::Forward(ForwardResolver::new(&config.resolver)?)
         };
-        #[cfg(all(not(feature = "dnssec"), not(feature = "recursive")))]
-        let upstream = UpstreamResolver::Forward(ForwardResolver::new(&config.resolver)?);
         let resolver = if config.dns_cache.enabled {
             CachingResolver::new(upstream, MemoryCache::new(&config.dns_cache))
         } else {
             CachingResolver::passthrough(upstream)
         };
 
-        #[cfg(feature = "blocker")]
-        let policy: Option<Arc<dyn Policy<Query = DnsQuery>>> = if config.blocker.enabled {
-            let cache = config.policy_cache.enabled.then_some(&config.policy_cache);
-            Some(Arc::new(DomainBlocker::new(
-                &config.blocker,
-                &clients,
-                cache,
-            )?))
-        } else {
-            None
-        };
-        #[cfg(not(feature = "blocker"))]
-        let policy: Option<Arc<dyn Policy<Query = DnsQuery>>> = None;
+        // The runtime control can enable filtering later, so the policy always
+        // exists. `blocker.enabled` is its initial state, not a build switch.
+        let blocker = Arc::new(DomainBlocker::new(
+            &config.blocker,
+            &clients,
+            config.policy_cache.enabled.then_some(&config.policy_cache),
+        )?);
+        let policy: Option<Arc<dyn Policy<Query = DnsQuery>>> = Some(blocker.clone());
+        let blocker_control: Option<Arc<dyn BlockerControl>> = Some(blocker);
         let block = BlockSettings::from_config(&config.blocker);
 
-        #[cfg(feature = "sqlite")]
         let storage: Option<Arc<dyn Storage>> = if config.storage.enabled {
             Some(Arc::new(SqliteStorage::open(&config.storage)?) as Arc<dyn Storage>)
         } else {
             None
         };
-        #[cfg(not(feature = "sqlite"))]
-        let storage: Option<Arc<dyn Storage>> = None;
 
-        #[cfg(feature = "statistics")]
         let stats: Option<Arc<dyn StatsSink>> = if config.stats.enabled {
             Some(Arc::new(StatsCollector::new(&config.stats)) as Arc<dyn StatsSink>)
         } else {
             None
         };
-        #[cfg(not(feature = "statistics"))]
-        let stats: Option<Arc<dyn StatsSink>> = None;
 
         let mut server = Server::with_access(
             NanoRequestHandler::with_sinks(
@@ -186,14 +142,8 @@ impl DnsServer<PipelineResolver> {
         for listener in &config.listeners.entries {
             registered += Self::bind_listener(&mut server, listener).await?;
         }
-        #[cfg(feature = "dot")]
-        {
-            registered += Self::bind_dot_listeners(&mut server, config).await?;
-        }
-        #[cfg(feature = "doh")]
-        {
-            registered += Self::bind_doh_listeners(&mut server, config).await?;
-        }
+        registered += Self::bind_dot_listeners(&mut server, config).await?;
+        registered += Self::bind_doh_listeners(&mut server, config).await?;
 
         if registered == 0 {
             return Err(ProtocolError::Server("no listeners were registered".to_owned()).into());
@@ -203,11 +153,11 @@ impl DnsServer<PipelineResolver> {
             server,
             storage,
             stats,
+            blocker: blocker_control,
         })
     }
 
     /// Register TLS listeners for every entry that opts into DoT.
-    #[cfg(feature = "dot")]
     async fn bind_dot_listeners(
         server: &mut Server<NanoRequestHandler<PipelineResolver>>,
         config: &Config,
@@ -251,7 +201,6 @@ impl DnsServer<PipelineResolver> {
     }
 
     /// Register HTTP/2 TLS listeners for every entry that opts into DoH.
-    #[cfg(feature = "doh")]
     async fn bind_doh_listeners(
         server: &mut Server<NanoRequestHandler<PipelineResolver>>,
         config: &Config,
@@ -340,6 +289,11 @@ where
         self.stats.as_ref().map(|stats| stats.snapshot())
     }
 
+    /// Shared runtime blocker control.
+    pub fn blocker_control(&self) -> Option<Arc<dyn BlockerControl>> {
+        self.blocker.clone()
+    }
+
     /// Run until every listener task finishes.
     pub async fn run(&mut self) -> Result<()> {
         self.server
@@ -414,28 +368,11 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
 
-    use nano_dns_core::config::Features;
-
-    fn features() -> Features {
-        Features {
-            forward: true,
-            recursive: false,
-            blocker: true,
-            sqlite: false,
-            statistics: false,
-            api: false,
-            web: false,
-            doh: false,
-            dot: false,
-            dnssec: false,
-        }
-    }
-
     #[test]
     fn empty_allow_list_defaults_to_loopback() {
         let mut config = Config::default();
         config.listeners.allowed_networks.clear();
-        config.validate(&features()).expect("config must validate");
+        config.validate().expect("config must validate");
 
         let networks = allowed_networks(&config);
         assert_eq!(networks.len(), 2);

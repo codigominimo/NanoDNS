@@ -1,6 +1,6 @@
 [package]
 name = "nano-dns-web"
-description = "Optional server-rendered web dashboard for NanoDNS"
+description = "Server-rendered web dashboard for NanoDNS"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

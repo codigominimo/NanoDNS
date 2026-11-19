@@ -1,6 +1,6 @@
 [package]
 name = "nano-dns-stats"
-description = "Optional in-memory statistics for NanoDNS"
+description = "In-memory statistics for NanoDNS"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

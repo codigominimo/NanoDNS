@@ -1,6 +1,6 @@
 [package]
 name = "nano-dns-api"
-description = "Optional REST API for NanoDNS"
+description = "REST API for NanoDNS"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

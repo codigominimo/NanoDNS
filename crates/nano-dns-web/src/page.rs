@@ -1,8 +1,9 @@
 //! Server-rendered HTML for the management dashboard.
 //!
 //! All dynamic values are escaped before being inserted, so a malicious
-//! instance name or queried domain can never inject markup.
+//! instance name, queried domain or runtime rule can never inject markup.
 
+use nano_dns_core::blocker::BlockerSnapshot;
 use nano_dns_core::model::StatsSnapshot;
 
 /// Values needed to render the dashboard.
@@ -12,6 +13,8 @@ pub(super) struct PageData<'a> {
     pub(super) uptime_secs: u64,
     pub(super) resolver_mode: &'a str,
     pub(super) stats: Option<StatsSnapshot>,
+    pub(super) blocker: Option<BlockerSnapshot>,
+    pub(super) token: &'a str,
 }
 
 /// Render the complete HTML document.
@@ -22,11 +25,18 @@ pub(super) fn render(data: &PageData<'_>) -> String {
         None => (
             String::new(),
             "<p class=\"notice\">Statistics are disabled. Enable <code>stats.enabled</code> \
-             and build with the <code>statistics</code> feature to see query data.</p>",
+             in the configuration to see query data.</p>",
+        ),
+    };
+    let (blocker_html, blocker_note) = match &data.blocker {
+        Some(snapshot) => (blocker_section(snapshot, data.token), ""),
+        None => (
+            String::new(),
+            "<p class=\"notice\">Ad blocking controls are unavailable for this instance.</p>",
         ),
     };
 
-    let mut html = String::with_capacity(6144);
+    let mut html = String::with_capacity(8192);
     html.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     html.push_str(&format!("<title>{instance} &middot; NanoDNS</title>\n"));
@@ -45,6 +55,8 @@ pub(super) fn render(data: &PageData<'_>) -> String {
     html.push_str(&card("Resolver", data.resolver_mode, ""));
     html.push_str("</section>\n");
 
+    html.push_str(blocker_note);
+    html.push_str(&blocker_html);
     html.push_str(stats_note);
     html.push_str(&stats_html);
 
@@ -62,6 +74,103 @@ fn card(label: &str, value: &str, class: &str) -> String {
         escape(label),
         escape(value)
     )
+}
+
+/// Render the ad blocker state, controls and block statistics.
+fn blocker_section(control: &BlockerSnapshot, token: &str) -> String {
+    let token_field = format!(
+        "<input type=\"hidden\" name=\"token\" value=\"{}\">",
+        escape(token)
+    );
+    let state = if control.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let state_class = if control.enabled { "good" } else { "bad" };
+    let (action, button) = if control.enabled {
+        ("false", "Disable filtering")
+    } else {
+        ("true", "Enable filtering")
+    };
+
+    let mut html = String::with_capacity(4096);
+    html.push_str("<section>\n<h2>Ad blocker</h2>\n<div class=\"cards\">\n");
+    html.push_str(&card("Filtering", state, state_class));
+    html.push_str(&card("Blocked", &control.total_blocked.to_string(), "bad"));
+    html.push_str("</div>\n");
+
+    html.push_str("<form class=\"control\" method=\"post\" action=\"/blocker/toggle\">");
+    html.push_str(&token_field);
+    html.push_str(&format!(
+        "<input type=\"hidden\" name=\"enabled\" value=\"{action}\">\
+         <button type=\"submit\">{button}</button>"
+    ));
+    html.push_str("</form>\n");
+
+    html.push_str("<form class=\"control\" method=\"post\" action=\"/blocker/domains\">");
+    html.push_str(&token_field);
+    html.push_str(
+        "<label for=\"domains\">Domains (one per line)</label>\
+         <textarea id=\"domains\" name=\"domains\" rows=\"4\" \
+         placeholder=\"ads.example.com\"></textarea>\
+         <label for=\"kind\">Rule type</label>\
+         <select id=\"kind\" name=\"kind\">\
+         <option value=\"deny\">Block (deny)</option>\
+         <option value=\"allow\">Allow</option></select> ",
+    );
+    html.push_str(
+        "<button type=\"submit\" name=\"action\" value=\"add\">Add</button> \
+         <button type=\"submit\" name=\"action\" value=\"remove\">Remove</button>",
+    );
+    html.push_str("</form>\n");
+
+    html.push_str("<form class=\"control\" method=\"post\" action=\"/blocker/domains\">");
+    html.push_str(&token_field);
+    html.push_str(
+        "<input type=\"hidden\" name=\"action\" value=\"clear\">\
+         <input type=\"hidden\" name=\"kind\" value=\"deny\">\
+         <button type=\"submit\">Clear deny rules</button>",
+    );
+    html.push_str("</form>\n");
+
+    html.push_str("<form class=\"control\" method=\"post\" action=\"/blocker/reload\">");
+    html.push_str(&token_field);
+    html.push_str("<button type=\"submit\">Reload local lists</button></form>\n");
+
+    html.push_str("<div class=\"grid\">\n");
+    html.push_str(&table(
+        "Runtime rules",
+        &["Domain (kind)", "Block hits"],
+        control.domains.iter().map(|entry| {
+            (
+                format!("{} ({})", entry.domain, entry.kind.as_str()),
+                entry.hits,
+            )
+        }),
+    ));
+    html.push_str(&table(
+        "Top blocked names",
+        &["Domain", "Hits"],
+        control.top_blocked.iter().cloned(),
+    ));
+    html.push_str(&table(
+        "Local lists",
+        &["List", "Domains"],
+        control.lists.iter().map(|list| {
+            (
+                format!(
+                    "{} ({}){}",
+                    list.name,
+                    list.category,
+                    if list.enabled { "" } else { " [disabled]" }
+                ),
+                list.entries as u64,
+            )
+        }),
+    ));
+    html.push_str("</div>\n</section>\n");
+    html
 }
 
 /// Render the statistics section with counters and breakdown tables.
@@ -200,10 +309,16 @@ header{margin-bottom:24px}.subtitle{margin:4px 0 0;color:var(--muted)}\n\
 .card.ok .value{color:var(--good)}.card.good .value{color:var(--good)}.card.bad .value{color:var(--bad)}\n\
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}\n\
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}\n\
+.control{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}\n\
+.control label{color:var(--muted);font-size:.85rem}\n\
+textarea,select{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:inherit}\n\
+textarea{flex:1 1 320px;resize:vertical}\n\
+button{background:var(--line);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px 14px;font:inherit;cursor:pointer}\n\
+button:hover{border-color:var(--muted)}\n\
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:6px 4px;border-bottom:1px solid var(--line)}\n\
 th{color:var(--muted);font-size:.8rem;text-transform:uppercase}.num{text-align:right;font-variant-numeric:tabular-nums}\n\
 .empty{color:var(--muted);text-align:center;padding:16px 4px}\n\
-.notice{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:8px;padding:12px 16px;color:var(--muted)}\n\
+.notice{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--good);border-radius:8px;padding:12px 16px;color:var(--muted);margin-bottom:24px}\n\
 code{background:var(--line);padding:1px 5px;border-radius:4px}\n\
 footer{text-align:center;color:var(--muted);font-size:.8rem;padding:0 20px 24px}\n\
 </style>\n";
@@ -211,6 +326,8 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;padding:0 20px 24px}
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    use nano_dns_core::blocker::{BlockListKind, BlockListStatus, BlockedDomain};
 
     use super::*;
 
@@ -227,6 +344,29 @@ mod tests {
             uptime_secs: 42,
             resolver_mode: "Forward",
             stats: Some(stats),
+            blocker: None,
+            token: "token123",
+        }
+    }
+
+    fn blocker_snapshot() -> BlockerSnapshot {
+        BlockerSnapshot {
+            enabled: true,
+            total_blocked: 7,
+            domains: vec![BlockedDomain {
+                domain: "ads.example.com".to_owned(),
+                kind: BlockListKind::Deny,
+                hits: 7,
+            }],
+            top_blocked: vec![("www.ads.example.com".to_owned(), 5)],
+            lists: vec![BlockListStatus {
+                id: "ads".to_owned(),
+                name: "Ads".to_owned(),
+                category: "Advertising".to_owned(),
+                source: "ads.txt".to_owned(),
+                enabled: true,
+                entries: 12,
+            }],
         }
     }
 
@@ -251,6 +391,31 @@ mod tests {
     }
 
     #[test]
+    fn renders_blocker_controls_and_counters() {
+        let mut page = data();
+        page.blocker = Some(blocker_snapshot());
+        let html = render(&page);
+        assert!(html.contains("Ad blocker"));
+        assert!(html.contains("Disable filtering"));
+        assert!(html.contains("ads.example.com (deny)"));
+        assert!(html.contains("www.ads.example.com"));
+        assert!(html.contains("Ads (Advertising)"));
+        assert!(html.contains("name=\"token\" value=\"token123\""));
+        assert!(html.contains("action=\"/blocker/toggle\""));
+    }
+
+    #[test]
+    fn disabled_blocker_shows_enable_action() {
+        let mut page = data();
+        let mut snapshot = blocker_snapshot();
+        snapshot.enabled = false;
+        page.blocker = Some(snapshot);
+        let html = render(&page);
+        assert!(html.contains("Enable filtering"));
+        assert!(!html.contains("Disable filtering"));
+    }
+
+    #[test]
     fn escapes_dynamic_values() {
         let mut page = data();
         page.instance = "<script>alert('x')</script>";
@@ -260,6 +425,9 @@ mod tests {
             .expect("stats")
             .top_domains
             .push(("<img src=x>".to_owned(), 1));
+        let mut blocker = blocker_snapshot();
+        blocker.domains[0].domain = "<script>rules</script>".to_owned();
+        page.blocker = Some(blocker);
         let html = render(&page);
         assert!(!html.contains("<script>"));
         assert!(!html.contains("<img src=x>"));

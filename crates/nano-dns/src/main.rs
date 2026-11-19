@@ -1,19 +1,18 @@
 //! NanoDNS executable entry point.
 //!
-//! Loads configuration, starts UDP/TCP DNS listeners and the optional DoT, DoH,
-//! REST API and web dashboard, then coordinates graceful shutdown across all
-//! servers.
+//! Loads configuration, starts UDP/TCP DNS listeners and the configured DoT,
+//! DoH, REST API and web dashboard, then coordinates graceful shutdown across
+//! all servers. Every capability is compiled in; the JSON configuration alone
+//! decides which ones run.
 
 use std::path::PathBuf;
 
 use clap::Parser;
-#[cfg(feature = "api")]
 use nano_dns_api::ApiServer;
-use nano_dns_core::config::{self, Config, DEFAULT_CONFIG_FILE, Features};
+use nano_dns_core::config::{self, Config, DEFAULT_CONFIG_FILE};
 use nano_dns_core::error::Result;
 use nano_dns_core::runtime;
 use nano_dns_protocol::DnsServer;
-#[cfg(feature = "web")]
 use nano_dns_web::WebServer;
 use tracing::info;
 
@@ -30,23 +29,9 @@ struct Args {
     check_config: bool,
 }
 
-/// Cargo features enabled in this build.
-const FEATURES: Features = Features {
-    forward: cfg!(feature = "forward"),
-    recursive: cfg!(feature = "recursive"),
-    blocker: cfg!(feature = "blocker"),
-    sqlite: cfg!(feature = "sqlite"),
-    statistics: cfg!(feature = "statistics"),
-    api: cfg!(feature = "api"),
-    web: cfg!(feature = "web"),
-    doh: cfg!(feature = "doh"),
-    dot: cfg!(feature = "dot"),
-    dnssec: cfg!(feature = "dnssec"),
-};
-
 fn main() -> Result<()> {
     let args = Args::parse();
-    let config = config::load(&args.config, &FEATURES)?;
+    let config = config::load(&args.config)?;
     let _tracing = runtime::install(&config);
 
     info!(
@@ -73,43 +58,36 @@ async fn run_servers(config: Config) -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    #[cfg(feature = "api")]
     let api = if config.api.enabled {
         Some(ApiServer::bind(&config, server.stats_sink()).await?)
     } else {
         None
     };
 
-    #[cfg(feature = "web")]
     let web = if config.web.enabled {
-        Some(WebServer::bind(&config, server.stats_sink()).await?)
+        Some(
+            WebServer::bind_with_blocker(&config, server.stats_sink(), server.blocker_control())
+                .await?,
+        )
     } else {
         None
     };
 
-    #[cfg(feature = "api")]
     let api_rx = shutdown_rx.clone();
-    #[cfg(feature = "api")]
     let api_task = async {
         match api {
             Some(api) => api.serve_with_signal(wait_shutdown(api_rx)).await,
             None => Ok(()),
         }
     };
-    #[cfg(not(feature = "api"))]
-    let api_task = async { Ok::<(), nano_dns_core::error::Error>(()) };
 
-    #[cfg(feature = "web")]
     let web_rx = shutdown_rx.clone();
-    #[cfg(feature = "web")]
     let web_task = async {
         match web {
             Some(web) => web.serve_with_signal(wait_shutdown(web_rx)).await,
             None => Ok(()),
         }
     };
-    #[cfg(not(feature = "web"))]
-    let web_task = async { Ok::<(), nano_dns_core::error::Error>(()) };
 
     let (dns_result, api_result, web_result) = tokio::join!(
         server.serve_with_signal(wait_shutdown(shutdown_rx)),
@@ -146,11 +124,5 @@ mod tests {
     fn cli_accepts_config_check_flag() {
         let args = Args::try_parse_from(["nano-dns", "--check-config"]).expect("args must parse");
         assert!(args.check_config);
-    }
-
-    #[test]
-    fn features_reflect_compilation_settings() {
-        assert!(FEATURES.forward || !FEATURES.forward);
-        assert_eq!(FEATURES.recursive, cfg!(feature = "recursive"));
     }
 }

@@ -559,7 +559,7 @@ impl Config {
     ///
     /// Every error returned here leaves the previous configuration untouched,
     /// so a hot reload can never apply a partially valid state.
-    pub fn validate(&self, features: &Features) -> ConfigResult<()> {
+    pub fn validate(&self) -> ConfigResult<()> {
         if self.version != 1 {
             return Err(ConfigError::Validation(format!(
                 "unsupported config version {}, expected 1",
@@ -627,11 +627,6 @@ impl Config {
 
         match self.resolver.mode {
             ResolverMode::Forward => {
-                if !features.forward {
-                    return Err(ConfigError::Validation(
-                        "forward mode requested but the binary was built without the 'forward' feature".to_owned(),
-                    ));
-                }
                 if self.resolver.upstreams.is_empty() {
                     return Err(ConfigError::Validation(
                         "resolver.upstreams cannot be empty in forward mode".to_owned(),
@@ -644,11 +639,6 @@ impl Config {
                 }
             }
             ResolverMode::Recursive => {
-                if !features.recursive {
-                    return Err(ConfigError::Validation(
-                        "recursive mode requested but the binary was built without the 'recursive' feature".to_owned(),
-                    ));
-                }
                 if self.resolver.root_hints.is_empty() {
                     return Err(ConfigError::Validation(
                         "resolver.root_hints cannot be empty in recursive mode".to_owned(),
@@ -662,19 +652,9 @@ impl Config {
             }
         }
 
-        if self.resolver.dnssec && !features.dnssec {
-            return Err(ConfigError::Validation(
-                "DNSSEC requested but the binary was built without the 'dnssec' feature".to_owned(),
-            ));
-        }
         if self.resolver.dnssec && self.resolver.mode != ResolverMode::Forward {
             return Err(ConfigError::Validation(
                 "DNSSEC validation requires resolver.mode = \"forward\"".to_owned(),
-            ));
-        }
-        if self.resolver.dnssec_trust_anchor.is_some() && !features.dnssec {
-            return Err(ConfigError::Validation(
-                "resolver.dnssec_trust_anchor requires the 'dnssec' feature".to_owned(),
             ));
         }
         if self.resolver.dnssec_trust_anchor.is_some() && !self.resolver.dnssec {
@@ -683,12 +663,6 @@ impl Config {
             ));
         }
 
-        if self.blocker.enabled && !features.blocker {
-            return Err(ConfigError::Validation(
-                "blocking enabled but the binary was built without the 'blocker' feature"
-                    .to_owned(),
-            ));
-        }
         if !self.blocker.enabled && !self.blocker.allowlist.is_empty() {
             return Err(ConfigError::Validation(
                 "blocker.allowlist is non-empty while blocking is disabled".to_owned(),
@@ -713,11 +687,6 @@ impl Config {
             ));
         }
 
-        if self.storage.enabled && !features.sqlite {
-            return Err(ConfigError::Validation(
-                "SQLite persistence requested but the binary was built without the 'sqlite' feature".to_owned(),
-            ));
-        }
         if !self.storage.enabled && self.storage.history {
             return Err(ConfigError::Validation(
                 "storage.history cannot be enabled while storage is disabled".to_owned(),
@@ -728,20 +697,9 @@ impl Config {
                 "storage.path cannot be empty when storage is enabled".to_owned(),
             ));
         }
-        if self.stats.enabled && !features.statistics {
-            return Err(ConfigError::Validation(
-                "statistics requested but the binary was built without the 'statistics' feature"
-                    .to_owned(),
-            ));
-        }
         if self.stats.enabled && self.stats.retention_secs == 0 {
             return Err(ConfigError::Validation(
                 "stats.retention_secs must be greater than zero when enabled".to_owned(),
-            ));
-        }
-        if self.api.enabled && !features.api {
-            return Err(ConfigError::Validation(
-                "API requested but the binary was built without the 'api' feature".to_owned(),
             ));
         }
         if self.api.enabled
@@ -755,16 +713,10 @@ impl Config {
                 "api.token cannot be empty when configured".to_owned(),
             ));
         }
-        if self.web.enabled && !features.web {
-            return Err(ConfigError::Validation(
-                "web interface requested but the binary was built without the 'web' feature"
-                    .to_owned(),
-            ));
-        }
         if self.dot.enabled {
-            if !features.dot || self.dot.cert_path.is_none() || self.dot.key_path.is_none() {
+            if self.dot.cert_path.is_none() || self.dot.key_path.is_none() {
                 return Err(ConfigError::Validation(
-                    "DoT requires the 'dot' feature and both cert_path and key_path".to_owned(),
+                    "DoT requires both cert_path and key_path".to_owned(),
                 ));
             }
             if self.dot.port == 0 {
@@ -779,9 +731,9 @@ impl Config {
             }
         }
         if self.doh.enabled {
-            if !features.doh || self.doh.cert_path.is_none() || self.doh.key_path.is_none() {
+            if self.doh.cert_path.is_none() || self.doh.key_path.is_none() {
                 return Err(ConfigError::Validation(
-                    "DoH requires the 'doh' feature and both cert_path and key_path".to_owned(),
+                    "DoH requires both cert_path and key_path".to_owned(),
                 ));
             }
             if self.doh.port == 0 {
@@ -842,36 +794,8 @@ impl Config {
     }
 }
 
-/// Compile-time features that a configuration may request.
-///
-/// The binary passes its actual Cargo features here so that invalid runtime
-/// requests are rejected before any socket is opened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Features {
-    /// Forward resolver support.
-    pub forward: bool,
-    /// Recursive resolver support.
-    pub recursive: bool,
-    /// Blocking support.
-    pub blocker: bool,
-    /// SQLite persistence support.
-    pub sqlite: bool,
-    /// Statistics support.
-    pub statistics: bool,
-    /// REST API support.
-    pub api: bool,
-    /// Web interface support.
-    pub web: bool,
-    /// DNS over HTTPS support.
-    pub doh: bool,
-    /// DNS over TLS support.
-    pub dot: bool,
-    /// DNSSEC support.
-    pub dnssec: bool,
-}
-
 /// Load and validate a JSON configuration file.
-pub fn load(path: &Path, features: &Features) -> ConfigResult<Config> {
+pub fn load(path: &Path) -> ConfigResult<Config> {
     let content = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
@@ -880,17 +804,17 @@ pub fn load(path: &Path, features: &Features) -> ConfigResult<Config> {
         path: path.to_path_buf(),
         source,
     })?;
-    config.validate(features)?;
+    config.validate()?;
     Ok(config)
 }
 
 /// Parse a configuration from a JSON string.
-pub fn from_str(input: &str, features: &Features) -> ConfigResult<Config> {
+pub fn from_str(input: &str) -> ConfigResult<Config> {
     let config: Config = serde_json::from_str(input).map_err(|source| ConfigError::Json {
         path: PathBuf::from("<string>"),
         source,
     })?;
-    config.validate(features)?;
+    config.validate()?;
     Ok(config)
 }
 
@@ -898,25 +822,10 @@ pub fn from_str(input: &str, features: &Features) -> ConfigResult<Config> {
 mod tests {
     use super::*;
 
-    fn features() -> Features {
-        Features {
-            forward: true,
-            recursive: false,
-            blocker: true,
-            sqlite: false,
-            statistics: false,
-            api: false,
-            web: false,
-            doh: false,
-            dot: false,
-            dnssec: false,
-        }
-    }
-
     #[test]
     fn default_config_is_valid() {
         Config::default()
-            .validate(&features())
+            .validate()
             .expect("defaults must be valid");
     }
 
@@ -924,98 +833,84 @@ mod tests {
     fn default_config_roundtrips_through_json() {
         let config = Config::default();
         let json = serde_json::to_string(&config).expect("serialization must succeed");
-        let restored = from_str(&json, &features()).expect("deserialization must succeed");
+        let restored = from_str(&json).expect("deserialization must succeed");
         assert_eq!(config, restored);
     }
 
     #[test]
     fn unknown_fields_are_rejected() {
         let json = r#"{"version":1,"unexpected":true}"#;
-        assert!(from_str(json, &features()).is_err());
+        assert!(from_str(json).is_err());
     }
 
     #[test]
-    fn recursive_mode_requires_feature_and_root_hints() {
+    fn recursive_mode_requires_root_hints() {
         let mut config = Config::default();
         config.resolver.mode = ResolverMode::Recursive;
-        assert!(config.validate(&features()).is_err());
+        assert!(config.validate().is_err());
 
         config
             .resolver
             .root_hints
             .push(IpAddr::V4(Ipv4Addr::new(198, 41, 0, 4)));
-        assert!(config.validate(&features()).is_err());
-
-        let mut all = features();
-        all.recursive = true;
         config
-            .validate(&all)
+            .validate()
             .expect("recursive configuration must be valid");
 
         config.resolver.root_port = 0;
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
     }
 
     #[test]
-    fn dnssec_requires_feature_forward_mode_and_consistent_trust_anchor() {
-        let mut all = features();
-        all.dnssec = true;
-        all.recursive = true;
-
+    fn dnssec_requires_forward_mode_and_consistent_trust_anchor() {
         let mut config = Config::default();
         config.resolver.dnssec = true;
-        config.validate(&all).expect("DNSSEC forward mode is valid");
+        config.validate().expect("DNSSEC forward mode is valid");
 
         config.resolver.mode = ResolverMode::Recursive;
         config
             .resolver
             .root_hints
             .push(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
 
         config.resolver.mode = ResolverMode::Forward;
         config.resolver.dnssec_trust_anchor = Some(PathBuf::from("anchors/dnskey.txt"));
-        config.validate(&all).expect("custom trust anchor is valid");
+        config.validate().expect("custom trust anchor is valid");
 
         config.resolver.dnssec = false;
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
 
         config.resolver.dnssec = true;
-        assert!(config.validate(&features()).is_err());
+        config.validate().expect("custom anchor implies DNSSEC");
     }
 
     #[test]
-    fn disabled_features_are_rejected_at_validation() {
+    fn storage_requires_consistent_options() {
         let mut config = Config::default();
         config.storage.enabled = true;
-        assert!(config.validate(&features()).is_err());
-
-        let mut all = features();
-        all.sqlite = true;
         config
-            .validate(&all)
-            .expect("sqlite feature allows persistence");
+            .validate()
+            .expect("persistence is fully available at runtime");
 
         config.storage.enabled = false;
         config.storage.history = true;
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
 
         config.storage.enabled = true;
         config.storage.path = PathBuf::new();
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
     }
 
     #[test]
     fn stats_require_positive_retention() {
-        let mut all = features();
-        all.statistics = true;
         let mut config = Config::default();
         config.stats.enabled = true;
         config.stats.retention_secs = 0;
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
 
         config.stats.retention_secs = 60;
-        config.validate(&all).expect("positive retention is valid");
+        config.validate().expect("positive retention is valid");
     }
 
     #[test]
@@ -1026,7 +921,7 @@ mod tests {
             port_tcp: 0,
             ..ListenerConfig::default()
         });
-        assert!(config.validate(&features()).is_err());
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -1044,73 +939,87 @@ mod tests {
                 denylist: Vec::new(),
             },
         );
-        assert!(config.validate(&features()).is_err());
+        assert!(config.validate().is_err());
     }
 
     #[test]
-    fn dot_requires_feature_paths_and_opt_in() {
-        let mut all = features();
-        all.dot = true;
+    fn dot_requires_paths_and_opt_in() {
         let mut config = Config::default();
         config.dot.enabled = true;
         config.dot.cert_path = Some(PathBuf::from("cert.pem"));
         config.dot.key_path = Some(PathBuf::from("cert.key"));
         // No listener opts into DoT yet.
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
 
         config.listeners.entries[0].dot = true;
-        config.validate(&all).expect("valid DoT configuration");
+        config.validate().expect("valid DoT configuration");
 
-        // Missing feature is rejected even with complete paths.
-        assert!(config.validate(&features()).is_err());
-
-        // Missing paths are rejected with the feature enabled.
+        // Missing paths are rejected.
         config.dot.key_path = None;
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
 
         // A zero port is invalid.
         config.dot.key_path = Some(PathBuf::from("cert.key"));
         config.dot.port = 0;
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
     }
 
     #[test]
-    fn doh_requires_feature_paths_opt_in_and_absolute_path() {
-        let mut all = features();
-        all.doh = true;
+    fn doh_requires_paths_opt_in_and_absolute_path() {
         let mut config = Config::default();
         config.doh.enabled = true;
         config.doh.cert_path = Some(PathBuf::from("cert.pem"));
         config.doh.key_path = Some(PathBuf::from("cert.key"));
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
 
         config.listeners.entries[0].doh = true;
-        config.validate(&all).expect("valid DoH configuration");
-
-        assert!(config.validate(&features()).is_err());
+        config.validate().expect("valid DoH configuration");
 
         config.doh.path = "dns-query".to_owned();
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
 
         config.doh.path = "/dns-query".to_owned();
         config.doh.port = 0;
-        assert!(config.validate(&all).is_err());
+        assert!(config.validate().is_err());
     }
 
     #[test]
     fn listener_cannot_request_disabled_transports() {
         let mut config = Config::default();
         config.listeners.entries[0].dot = true;
-        assert!(config.validate(&features()).is_err());
+        assert!(config.validate().is_err());
 
         config.listeners.entries[0].dot = false;
         config.listeners.entries[0].doh = true;
-        assert!(config.validate(&features()).is_err());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn every_runtime_service_can_be_enabled_at_once() {
+        let mut config = Config::default();
+        config.blocker.enabled = true;
+        config.storage.enabled = true;
+        config.stats.enabled = true;
+        config.api.enabled = true;
+        config.web.enabled = true;
+        config.resolver.dnssec = true;
+        config.dot.enabled = true;
+        config.dot.cert_path = Some(PathBuf::from("cert.pem"));
+        config.dot.key_path = Some(PathBuf::from("cert.key"));
+        config.doh.enabled = true;
+        config.doh.cert_path = Some(PathBuf::from("cert.pem"));
+        config.doh.key_path = Some(PathBuf::from("cert.key"));
+        config.listeners.entries[0].dot = true;
+        config.listeners.entries[0].doh = true;
+
+        config
+            .validate()
+            .expect("JSON must be able to enable every service");
     }
 
     #[test]
     fn load_reports_io_errors_with_path() {
-        let error = load(Path::new("definitely-missing-nano-dns.json"), &features())
+        let error = load(Path::new("definitely-missing-nano-dns.json"))
             .expect_err("missing file must fail");
         assert!(matches!(error, ConfigError::Read { .. }));
     }

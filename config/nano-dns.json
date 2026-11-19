@@ -73,7 +73,7 @@
     "allowed_networks": ["127.0.0.0/8", "::1/128"]
   },
   "web": {
-    "enabled": false,
+    "enabled": true,
     "listen": "127.0.0.1",
     "port": 8081
   },

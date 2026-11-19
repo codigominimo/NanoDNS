@@ -9,7 +9,7 @@ pub enum BlockerError {
     #[error("remote block list source {0} is not supported; use a local file")]
     RemoteSource(String),
     /// A configured list file could not be read.
-    #[error("cannot read block list {path}: {source}")]
+    #[error("cannot read block list {}: {source}", path.display())]
     Io {
         /// Path that failed to load.
         path: PathBuf,
@@ -17,7 +17,7 @@ pub enum BlockerError {
         source: std::io::Error,
     },
     /// The list file is not valid UTF-8.
-    #[error("block list {path} is not valid UTF-8: {source}")]
+    #[error("block list {} is not valid UTF-8: {source}", path.display())]
     Encoding {
         /// Path that failed to decode.
         path: PathBuf,

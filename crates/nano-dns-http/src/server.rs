@@ -1,8 +1,8 @@
 //! Generic, dependency-light HTTP/1.1 server for local management interfaces.
 //!
-//! One request per connection, `GET`-friendly, no body parsing and no
-//! streaming. Handlers are plain functions over shared state, so callers own
-//! routing, authentication and response construction.
+//! One request per connection, with small form bodies and no streaming.
+//! Handlers are plain functions over shared state, so callers own routing,
+//! authentication and response construction.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,14 +23,18 @@ const MAX_HEAD_BYTES: usize = 8 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum number of header lines accepted.
 const MAX_HEADERS: usize = 32;
+/// Maximum number of bytes accepted in a request body.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// A parsed HTTP request head.
+/// A parsed HTTP request, including a small form body when present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     /// HTTP method, upper case as sent by the client.
     pub method: String,
     /// Request target, usually a path with an optional query string.
     pub path: String,
+    /// Raw request body, empty for requests without `Content-Length`.
+    pub body: Vec<u8>,
     headers: HashMap<String, String>,
 }
 
@@ -40,18 +44,34 @@ impl Request {
         Self {
             method: method.into(),
             path: path.into(),
+            body: Vec::new(),
             headers: HashMap::new(),
         }
     }
 
     /// Look up a header by its case-insensitive name.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(name).map(String::as_str)
+        self.headers
+            .get(name)
+            .or_else(|| self.headers.get(&name.to_ascii_lowercase()))
+            .map(String::as_str)
     }
 
     /// Path component without the query string.
     pub fn route_path(&self) -> &str {
         self.path.split('?').next().unwrap_or_default()
+    }
+
+    /// Decode the body as `application/x-www-form-urlencoded` pairs.
+    pub fn form(&self) -> HashMap<String, String> {
+        parse_pairs(&String::from_utf8_lossy(&self.body))
+    }
+
+    /// Decode the query string into URL-decoded key/value pairs.
+    pub fn query(&self) -> HashMap<String, String> {
+        self.path
+            .split_once('?')
+            .map_or_else(HashMap::new, |(_, query)| parse_pairs(query))
     }
 }
 
@@ -100,6 +120,16 @@ impl Response {
         }
     }
 
+    /// Build a redirect to a fixed local path.
+    pub fn redirect(location: &'static str) -> Self {
+        Self {
+            status: 303,
+            content_type: "text/plain; charset=utf-8",
+            body: Vec::new(),
+            extra_headers: vec![("Location", location)],
+        }
+    }
+
     /// Append an extra response header.
     pub fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
         self.extra_headers.push((name, value));
@@ -115,6 +145,7 @@ impl Response {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            303 => "See Other",
             500 => "Internal Server Error",
             _ => "Unknown",
         }
@@ -216,13 +247,40 @@ async fn handle_connection<S>(
     write_response(&mut stream, &response).await
 }
 
-/// Read and parse one request head.
+/// Read and parse one request, including a bounded form body.
 async fn read_request(stream: &mut TcpStream) -> Result<Option<Request>, HttpError> {
-    let head = read_head(stream).await?;
-    let Some(head) = head else {
+    let data = read_head(stream).await?;
+    let Some(data) = data else {
         return Ok(None);
     };
-    parse_request(&head).map(Some)
+    let terminator = find_subslice(&data, b"\r\n\r\n")
+        .ok_or(HttpError::InvalidRequest("missing header terminator"))?;
+    let split = terminator + 4;
+    let mut request = parse_request(&data[..split])?;
+
+    let content_length = request
+        .header("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        return Err(HttpError::InvalidRequest("request body too large"));
+    }
+
+    let mut body = data[split..].to_vec();
+    while body.len() < content_length {
+        let mut chunk = [0u8; 1024];
+        let read = timeout(READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| HttpError::InvalidRequest("read timed out"))?
+            .map_err(HttpError::Read)?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+    request.body = body;
+    Ok(Some(request))
 }
 
 /// Read bytes until the header terminator or the size limit is reached.
@@ -294,6 +352,7 @@ fn parse_request(head: &[u8]) -> Result<Request, HttpError> {
     Ok(Request {
         method: method.to_owned(),
         path: path.to_owned(),
+        body: Vec::new(),
         headers,
     })
 }
@@ -326,6 +385,53 @@ pub async fn write_response(stream: &mut TcpStream, response: &Response) -> Resu
     Ok(())
 }
 
+/// Decode a `key=value&key=value` sequence, tolerating malformed escapes.
+fn parse_pairs(input: &str) -> HashMap<String, String> {
+    let mut pairs = HashMap::new();
+    for pair in input.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if !key.is_empty() {
+            pairs.insert(decode_component(key), decode_component(value));
+        }
+    }
+    pairs
+}
+
+/// URL-decode one component (`+` means space, `%XX` means a raw byte).
+fn decode_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let escape = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+                if let Some(value) = escape.and_then(|text| u8::from_str_radix(text, 16).ok()) {
+                    decoded.push(value);
+                    index += 3;
+                } else {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// Return the byte offset of `needle` in `haystack`, if present.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
@@ -347,7 +453,7 @@ mod tests {
         assert_eq!(request.method, "GET");
         assert_eq!(request.route_path(), "/api/v1/status");
         assert_eq!(request.header("authorization"), Some("Bearer secret"));
-        assert_eq!(request.header("HOST"), None);
+        assert_eq!(request.header("HOST"), Some("localhost"));
     }
 
     #[test]
@@ -377,5 +483,25 @@ mod tests {
         let html = Response::html(200, "<h1>NanoDNS</h1>");
         assert_eq!(html.content_type, "text/html; charset=utf-8");
         assert_eq!(html.body, b"<h1>NanoDNS</h1>");
+    }
+
+    #[test]
+    fn decodes_form_and_query_parameters() {
+        let mut request = Request::new("POST", "/blocker/domains?next=%2F");
+        request.body = b"kind=deny&domain=www.example.com&token=a+b%2Fc".to_vec();
+        assert_eq!(request.form().get("kind").map(String::as_str), Some("deny"));
+        assert_eq!(
+            request.form().get("token").map(String::as_str),
+            Some("a b/c")
+        );
+        assert_eq!(request.query().get("next").map(String::as_str), Some("/"));
+    }
+
+    #[test]
+    fn redirect_adds_a_location_header() {
+        let response = Response::redirect("/");
+        assert_eq!(response.status, 303);
+        assert_eq!(response.reason(), "See Other");
+        assert!(response.extra_headers.contains(&("Location", "/")));
     }
 }
