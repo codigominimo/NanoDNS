@@ -16,3 +16,7 @@ nano-dns-web.workspace = true
 clap.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+

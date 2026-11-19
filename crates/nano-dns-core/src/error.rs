@@ -35,6 +35,9 @@ pub enum Error {
     /// Runtime or I/O error.
     #[error("{0}")]
     Runtime(String),
+    /// Installation or management of an OS service failed.
+    #[error("service error: {0}")]
+    Service(String),
 }
 
 /// Result alias used throughout NanoDNS.

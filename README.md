@@ -85,6 +85,82 @@ La validación sigue siendo estricta y se ejecuta antes de abrir cualquier socke
 
 Ejemplo: para usar solo el panel web con filtrado, deja `blocker.enabled` y `web.enabled` en `true` y mantén `storage`, `stats`, `api`, `dot` y `doh` en `false`, como en `config/nano-dns.json`. Para añadir estadísticas y SQLite, cambia esos dos interruptores a `true` y reinicia.
 
+## Instalación como servicio
+
+El mismo ejecutable se instala y se gestiona como servicio en Windows (Service Control Manager) y en Linux (systemd). No hay compilaciones ni binarios distintos.
+
+| Subcomando | Acción |
+| --- | --- |
+| `install-service` | Copia el binario y el JSON a las rutas del sistema y registra el servicio con inicio automático. |
+| `uninstall-service` | Detiene y elimina el servicio. `--purge` también borra configuración y datos. |
+| `start` / `stop` | Inicia o detiene el servicio. |
+| `status` | Muestra el estado del servicio. |
+| `print-unit` | Imprime la unidad systemd sin instalar nada (solo Linux). |
+
+La opción global `--config` acepta la ruta del JSON tanto antes como después del subcomando. Sin subcomando, NanoDNS sigue ejecutándose en consola como hasta ahora.
+
+### Windows
+
+Desde una terminal de **Administrador**:
+
+```powershell
+nano-dns.exe install-service --config C:\ruta\nano-dns.json
+nano-dns.exe start
+nano-dns.exe status
+nano-dns.exe stop
+nano-dns.exe uninstall-service --purge
+```
+
+El instalador copia el ejecutable y la configuración a `%ProgramData%\NanoDNS`, concede acceso a la cuenta virtual `NT SERVICE\NanoDNS` (sin contraseña ni usuario interactivo), registra el nombre `NanoDNS` con inicio automático y reinicio tras fallos, y configura el apagado mediante eventos del SCM. Las rutas relativas del JSON se resuelven desde ese directorio: el instalador copia allí el directorio `data` que acompañe al JSON de origen. Los logs se escriben en `%ProgramData%\NanoDNS\nano-dns.log`, porque la salida estándar de un servicio de Windows no es visible. Para actualizar el binario, detén el servicio antes de ejecutar `install-service` de nuevo.
+
+### Linux
+
+```bash
+sudo nano-dns install-service --config config/nano-dns.json
+sudo nano-dns start
+nano-dns status
+sudo nano-dns stop
+sudo nano-dns uninstall-service --purge
+```
+
+El instalador crea el usuario de sistema sin privilegios `nanodns`, copia el binario a `/usr/local/bin/nano-dns` y el JSON a `/etc/nanodns/nano-dns.json`, prepara `/var/lib/nanodns` y escribe `/etc/systemd/system/nano-dns.service`. Las rutas relativas del JSON se resuelven desde `/var/lib/nanodns`: el instalador copia allí el directorio `data` que acompañe al JSON de origen. La unidad ejecuta el proceso como `nanodns`, limita capacidades a `CAP_NET_BIND_SERVICE` (para poder enlazar el puerto 53 sin root), aplica aislamiento de sistema de archivos y envía la salida a journald: `journalctl -u nano-dns -f`. `print-unit` permite generar esa unidad en despliegues gestionados por plantillas.
+
+### Compilación para x86 y ARM
+
+Hay dos scripts locales que producen cuatro artefactos en `dist/<target>/` (binario más JSON de ejemplo):
+
+```powershell
+# En Windows: MSVC x86_64 + ARM64 y Linux x86_64 + ARM64
+powershell -ExecutionPolicy Bypass -File scripts/build-all.ps1
+```
+
+```bash
+# En Linux o WSL: Linux x86_64 + ARM64 y Windows GNU x86_64 + ARM64
+PROFILE=release scripts/build-all.sh
+CARGO="cargo cross" scripts/build-all.sh
+```
+
+Requisitos verificados en este entorno:
+
+- `rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu`.
+- LLVM (`scoop install llvm`): aporta `clang-cl` y `llvm-lib`, necesarios para compilar el código C de `ring` y SQLite en ARM64.
+- Zig y cargo-zigbuild (`scoop install zig; cargo install cargo-zigbuild --locked`): permiten generar los cuatro binarios cruzados sin WSL ni toolchains GCC por arquitectura. `build-all.ps1` y `build-all.sh` usan `cargo zigbuild` automáticamente cuando está disponible.
+- Visual Studio Build Tools con el componente `Microsoft.VisualStudio.Component.VC.Tools.ARM64` y el SDK de Windows con bibliotecas ARM64: necesario para **enlazar** el binario `aarch64-pc-windows-msvc`. Sin él, `cargo check` valida ese target pero el enlazado falla. Se instala desde el Instalador de Visual Studio o con:
+  `setup.exe modify --installPath "C:\Program Files\Microsoft Visual Studio\2022\Community" --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --passive --norestart` (requiere administrador).
+
+Cada script informa de los targets que no puede construir y devuelve error si alguno falla. En Windows, `-SkipUnavailable` permite continuar con los demás targets y devuelve 0 aunque falte alguna toolchain; sin esa opción, el script se detiene en el primer fallo.
+
+Tamaños de los binarios release generados (`perfil release`, sin comprimir):
+
+| Target | Tamaño |
+| --- | --- |
+| `x86_64-pc-windows-msvc` | 6 386 176 bytes (6,09 MB) |
+| `aarch64-pc-windows-msvc` | 5 856 768 bytes (5,59 MB) |
+| `x86_64-unknown-linux-gnu` | 7 083 536 bytes (6,76 MB) |
+| `aarch64-unknown-linux-gnu` | 6 327 560 bytes (6,03 MB) |
+
+Estos valores pueden variar ligeramente con la versión del compilador y de las dependencias.
+
 ## Decisiones técnicas de la Fase 1
 
 - `nano-dns-core` no depende de Hickory DNS: las librerías externas de protocolo quedan encapsuladas en crates posteriores.
